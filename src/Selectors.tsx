@@ -5,6 +5,7 @@ import type {
   DiffScope,
   DiffViewMode,
   GitLogEntry,
+  GitPullRequestCommit,
   GitPullRequestEntry,
 } from './types';
 
@@ -572,10 +573,8 @@ export const BranchTargetSelector: React.FC<BranchTargetSelectorProps> = ({
   const options = useMemo(() => {
     const query = search.trim().toLowerCase();
     const list: Array<{ key: string; label: string; value: BranchTargetValue }> = [];
-    const wtLabel = currentBranch
-      ? `${currentBranch} + working tree`
-      : 'Working tree';
-    const headLabel = currentBranch ? `${currentBranch} (committed)` : 'HEAD (committed)';
+    const wtLabel = 'Working Tree';
+    const headLabel = currentBranch || 'HEAD';
 
     if (!query || wtLabel.toLowerCase().includes(query)) {
       list.push({ key: '__wt__', label: wtLabel, value: { kind: 'working-tree' } });
@@ -609,9 +608,9 @@ export const BranchTargetSelector: React.FC<BranchTargetSelectorProps> = ({
 
   const currentLabel =
     target.kind === 'working-tree'
-      ? 'Working tree'
+      ? 'Working Tree'
       : target.kind === 'head-committed'
-        ? 'Committed'
+        ? currentBranch || 'HEAD'
         : branchRefLabel(target.ref);
 
   const isSelected = (val: BranchTargetValue): boolean => {
@@ -1046,6 +1045,225 @@ export const PullRequestComparisonSelector: React.FC<PullRequestComparisonSelect
               )}
             </div>
           )}
+        </div>
+      ) : null}
+    </div>
+  );
+};
+
+export type PrCommitRangeValue = { fromOid: string; toOid: string } | null;
+
+export interface PullRequestCommitRangeSelectorProps {
+  commits: readonly GitPullRequestCommit[];
+  range: PrCommitRangeValue;
+  onSelectRange: (range: PrCommitRangeValue) => void;
+}
+
+export const PullRequestCommitRangeSelector: React.FC<PullRequestCommitRangeSelectorProps> = ({
+  commits,
+  range,
+  onSelectRange,
+}) => {
+  const [open, setOpen] = useState(false);
+  const [search, setSearch] = useState('');
+  const [activeIndex, setActiveIndex] = useState(0);
+  const anchorIdxRef = useRef<number | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  useClickOutsideAndEscape(
+    open,
+    () => {
+      setOpen(false);
+      setSearch('');
+    },
+    containerRef,
+  );
+
+  useEffect(() => {
+    if (open) {
+      requestAnimationFrame(() => inputRef.current?.focus());
+    }
+  }, [open]);
+
+  const selectedBounds = useMemo<{ startIdx: number; endIdx: number } | null>(() => {
+    if (!range) return null;
+    const fromIdx = commits.findIndex((c) => c.oid === range.fromOid);
+    const toIdx = commits.findIndex((c) => c.oid === range.toOid);
+    if (fromIdx === -1 || toIdx === -1) return null;
+    return {
+      startIdx: Math.min(fromIdx, toIdx),
+      endIdx: Math.max(fromIdx, toIdx),
+    };
+  }, [commits, range]);
+
+  const filteredCommits = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return commits
+      .map((commit, originalIndex) => ({ commit, originalIndex }))
+      .filter(
+        ({ commit }) =>
+          !q ||
+          commit.message.toLowerCase().includes(q) ||
+          commit.author.toLowerCase().includes(q) ||
+          commit.oid.toLowerCase().includes(q),
+      );
+  }, [commits, search]);
+
+  const triggerLabel = useMemo(() => {
+    if (!range || !selectedBounds) {
+      return `All commits (${commits.length})`;
+    }
+    if (range.fromOid === range.toOid) {
+      return range.fromOid.slice(0, 8);
+    }
+    const count = selectedBounds.endIdx - selectedBounds.startIdx + 1;
+    return `${range.fromOid.slice(0, 7)}..${range.toOid.slice(0, 7)} (${count})`;
+  }, [commits.length, range, selectedBounds]);
+
+  const handleCommitClick = (clickedIdx: number, shiftKey: boolean) => {
+    const clicked = commits[clickedIdx];
+    if (!clicked) return;
+
+    if (shiftKey) {
+      const anchorIdx = anchorIdxRef.current ?? selectedBounds?.startIdx ?? clickedIdx;
+      anchorIdxRef.current = anchorIdx;
+      const startIdx = Math.min(anchorIdx, clickedIdx);
+      const endIdx = Math.max(anchorIdx, clickedIdx);
+      const fromCommit = commits[startIdx];
+      const toCommit = commits[endIdx];
+      if (fromCommit && toCommit) {
+        onSelectRange({ fromOid: fromCommit.oid, toOid: toCommit.oid });
+      }
+      return;
+    }
+
+    anchorIdxRef.current = clickedIdx;
+    onSelectRange({ fromOid: clicked.oid, toOid: clicked.oid });
+    setOpen(false);
+    setSearch('');
+  };
+
+  const totalOptions = 1 + filteredCommits.length;
+
+  const handleKeyDown = (event: React.KeyboardEvent) => {
+    if (isNavDown(event)) {
+      event.preventDefault();
+      if (totalOptions > 0) setActiveIndex((prev) => (prev + 1) % totalOptions);
+    } else if (isNavUp(event)) {
+      event.preventDefault();
+      if (totalOptions > 0) {
+        setActiveIndex((prev) => (prev - 1 + totalOptions) % totalOptions);
+      }
+    } else if (event.key === 'Enter' && open) {
+      event.preventDefault();
+      if (activeIndex === 0) {
+        onSelectRange(null);
+        setOpen(false);
+        setSearch('');
+      } else {
+        const entry = filteredCommits[activeIndex - 1];
+        if (entry) {
+          handleCommitClick(entry.originalIndex, event.shiftKey);
+        }
+      }
+    }
+  };
+
+  if (commits.length === 0) return null;
+
+  return (
+    <div ref={containerRef} className="oc-dropdown" onKeyDown={handleKeyDown}>
+      <button
+        type="button"
+        className="oc-picker-trigger"
+        title={`PR commits: ${triggerLabel}`}
+        aria-label="Select PR commit range"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        onClick={() => {
+          setActiveIndex(0);
+          setOpen((prev) => !prev);
+        }}
+      >
+        <Icon name="git-commit" className="oc-icon-sm oc-muted-icon" />
+        <span className="oc-picker-trigger-label">{triggerLabel}</span>
+        <Icon name="arrow-down-s" className="oc-icon-sm oc-muted-icon" />
+      </button>
+      {open ? (
+        <div className="oc-dropdown-menu oc-dropdown-menu--commit">
+          <div className="oc-dropdown-search-wrap">
+            <Icon name="search" className="oc-icon-sm oc-dropdown-search-icon" />
+            <input
+              ref={inputRef}
+              type="text"
+              value={search}
+              onChange={(event) => {
+                setSearch(event.target.value);
+                setActiveIndex(0);
+              }}
+              placeholder="Filter PR commits (Shift+click for range)…"
+              className="oc-dropdown-search-input"
+            />
+          </div>
+          <div role="listbox" className="oc-dropdown-list">
+            <button
+              type="button"
+              role="option"
+              aria-selected={range === null}
+              className={`oc-dropdown-item ${activeIndex === 0 ? 'oc-dropdown-item--active' : ''}`}
+              onMouseEnter={() => setActiveIndex(0)}
+              onClick={() => {
+                anchorIdxRef.current = null;
+                onSelectRange(null);
+                setOpen(false);
+                setSearch('');
+              }}
+            >
+              <span className="oc-dropdown-item-label">All commits ({commits.length})</span>
+              {range === null ? <Icon name="check" className="oc-icon-sm" /> : null}
+            </button>
+            {filteredCommits.map(({ commit, originalIndex }, idx) => {
+              const optionIndex = idx + 1;
+              const inRange =
+                selectedBounds !== null &&
+                originalIndex >= selectedBounds.startIdx &&
+                originalIndex <= selectedBounds.endIdx;
+              const highlighted = activeIndex === optionIndex;
+              const shortDate = Number.isNaN(new Date(commit.date).getTime())
+                ? commit.date
+                : new Date(commit.date).toLocaleDateString(undefined, {
+                    month: 'short',
+                    day: 'numeric',
+                  });
+              return (
+                <button
+                  key={commit.oid}
+                  type="button"
+                  role="option"
+                  aria-selected={inRange}
+                  className={`oc-dropdown-item oc-dropdown-item--commit ${
+                    highlighted ? 'oc-dropdown-item--active' : ''
+                  } ${inRange ? 'oc-dropdown-item--in-range' : ''}`}
+                  onMouseEnter={() => setActiveIndex(optionIndex)}
+                  onClick={(event) => handleCommitClick(originalIndex, event.shiftKey)}
+                >
+                  <div className="oc-commit-option-body">
+                    <div className="oc-commit-option-title" title={commit.message}>
+                      {commit.message}
+                    </div>
+                    <div className="oc-commit-option-meta">
+                      <span>
+                        {commit.author}
+                        {shortDate ? ` · ${shortDate}` : ''} · {commit.oid.slice(0, 8)}
+                      </span>
+                    </div>
+                  </div>
+                  {inRange ? <Icon name="check" className="oc-icon-sm" /> : null}
+                </button>
+              );
+            })}
+          </div>
         </div>
       ) : null}
     </div>

@@ -920,15 +920,183 @@ var mapGithubFileStatus = (status) => {
       return "M";
   }
 };
-var readPullRequestFiles = async (directory, prNumber) => {
-  if (!Number.isInteger(prNumber) || prNumber <= 0) {
-    throw new Error("Valid pull request number is required");
+var PR_GRAPHQL_QUERY = `
+  query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+    repository(owner: $owner, name: $repo) {
+      pullRequest(number: $number) {
+        id
+        baseRefName
+        baseRefOid
+        headRefName
+        headRefOid
+        commits(first: 100) {
+          nodes {
+            commit {
+              oid
+              messageHeadline
+              committedDate
+              author {
+                name
+                user {
+                  login
+                }
+              }
+              parents(first: 1) {
+                nodes {
+                  oid
+                }
+              }
+            }
+          }
+        }
+        files(first: 100, after: $cursor) {
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+          nodes {
+            path
+            viewerViewedState
+          }
+        }
+      }
+    }
+  }
+`;
+var fetchPrGraphqlMetadata = async (repoRoot, prNumber) => {
+  const viewedByPath = new Map;
+  const commits = [];
+  let pullRequestNodeId = null;
+  let baseRefName;
+  let baseRefOid;
+  let headRefName;
+  let headRefOid;
+  let cursor = null;
+  for (let page = 0;page < 10; page += 1) {
+    const args = [
+      "api",
+      "graphql",
+      "-F",
+      "owner={owner}",
+      "-F",
+      "repo={repo}",
+      "-F",
+      `number=${prNumber}`,
+      "-f",
+      `query=${PR_GRAPHQL_QUERY}`
+    ];
+    if (cursor) {
+      args.push("-F", `cursor=${cursor}`);
+    }
+    const res = await execGh(repoRoot, args);
+    if (!res.ok || !res.stdout.trim())
+      break;
+    try {
+      const parsed = JSON.parse(res.stdout);
+      const pr = parsed.data?.repository?.pullRequest;
+      if (!pr)
+        break;
+      if (pr.id)
+        pullRequestNodeId = pr.id;
+      if (pr.baseRefName)
+        baseRefName = pr.baseRefName;
+      if (pr.baseRefOid)
+        baseRefOid = pr.baseRefOid;
+      if (pr.headRefName)
+        headRefName = pr.headRefName;
+      if (pr.headRefOid)
+        headRefOid = pr.headRefOid;
+      if (page === 0 && pr.commits?.nodes) {
+        for (const node of pr.commits.nodes) {
+          const c = node?.commit;
+          if (!c?.oid)
+            continue;
+          commits.push({
+            oid: c.oid,
+            message: c.messageHeadline ?? c.oid.slice(0, 8),
+            author: c.author?.user?.login || c.author?.name || "unknown",
+            date: c.committedDate ?? "",
+            parentOid: c.parents?.nodes?.[0]?.oid
+          });
+        }
+      }
+      for (const fileNode of pr.files?.nodes ?? []) {
+        if (fileNode?.path && fileNode.viewerViewedState) {
+          viewedByPath.set(fileNode.path, fileNode.viewerViewedState);
+        }
+      }
+      if (pr.files?.pageInfo?.hasNextPage && pr.files.pageInfo.endCursor) {
+        cursor = pr.files.pageInfo.endCursor;
+      } else {
+        break;
+      }
+    } catch {
+      break;
+    }
+  }
+  return {
+    pullRequestNodeId,
+    viewedByPath,
+    commits,
+    baseRefName,
+    baseRefOid,
+    headRefName,
+    headRefOid
+  };
+};
+var setPullRequestFileViewed = async (params) => {
+  const { directory, pullRequestNodeId, filePath, viewed } = params;
+  if (!pullRequestNodeId || !filePath) {
+    throw new Error("pullRequestNodeId and path are required");
   }
   const top = await git(directory, ["rev-parse", "--show-toplevel"]);
   if (!top.ok || !top.stdout.trim())
     throw new Error("Not a git repository");
   const repoRoot = top.stdout.trim();
-  const [metaRes, filesRes] = await Promise.all([
+  const mutationName = viewed ? "markFileAsViewed" : "unmarkFileAsViewed";
+  const query = `
+    mutation($prId: ID!, $path: String!) {
+      ${mutationName}(input: { pullRequestId: $prId, path: $path }) {
+        clientMutationId
+      }
+    }
+  `;
+  const res = await execGh(repoRoot, [
+    "api",
+    "graphql",
+    "-F",
+    `prId=${pullRequestNodeId}`,
+    "-F",
+    `path=${filePath}`,
+    "-f",
+    `query=${query}`
+  ]);
+  if (!res.ok) {
+    throw new Error(res.stderr.trim() || `Failed to ${mutationName}`);
+  }
+  if (res.stdout.trim()) {
+    const parsed = JSON.parse(res.stdout);
+    if (Array.isArray(parsed.errors) && parsed.errors.length > 0) {
+      throw new Error(parsed.errors[0]?.message || `GraphQL error in ${mutationName}`);
+    }
+  }
+  return {
+    ok: true,
+    path: filePath,
+    viewedState: viewed ? "VIEWED" : "UNVIEWED"
+  };
+};
+var readPullRequestFiles = async (directory, prNumber, fromCommit, toCommit) => {
+  if (!Number.isInteger(prNumber) || prNumber <= 0) {
+    throw new Error("Valid pull request number is required");
+  }
+  const hasCommitRange = Boolean(fromCommit && toCommit && SHA_RE.test(fromCommit) && SHA_RE.test(toCommit));
+  const top = await git(directory, ["rev-parse", "--show-toplevel"]);
+  if (!top.ok || !top.stdout.trim())
+    throw new Error("Not a git repository");
+  const repoRoot = top.stdout.trim();
+  const [graphqlMeta, metaRes, filesRes] = await Promise.all([
+    fetchPrGraphqlMetadata(repoRoot, prNumber),
     execGh(repoRoot, [
       "pr",
       "view",
@@ -936,30 +1104,89 @@ var readPullRequestFiles = async (directory, prNumber) => {
       "--json",
       "baseRefName,baseRefOid,headRefName,headRefOid"
     ]),
-    execGh(repoRoot, [
+    hasCommitRange ? Promise.resolve(null) : execGh(repoRoot, [
       "api",
       "--paginate",
       "--slurp",
       `repos/{owner}/{repo}/pulls/${prNumber}/files?per_page=100`
     ])
   ]);
-  if (!metaRes.ok) {
+  if (!metaRes.ok && !graphqlMeta.baseRefOid) {
     throw new Error(metaRes.stderr.trim() || `Failed to load PR #${prNumber}`);
   }
-  const meta = JSON.parse(metaRes.stdout);
-  if (filesRes.ok && filesRes.stdout.trim()) {
+  const meta = metaRes.ok ? JSON.parse(metaRes.stdout) : {
+    baseRefName: graphqlMeta.baseRefName ?? "main",
+    baseRefOid: graphqlMeta.baseRefOid ?? "",
+    headRefName: graphqlMeta.headRefName ?? "HEAD",
+    headRefOid: graphqlMeta.headRefOid ?? ""
+  };
+  const attachViewed = (list) => list.map((f) => ({
+    ...f,
+    viewedState: graphqlMeta.viewedByPath.get(f.path) ?? "UNVIEWED"
+  }));
+  if (hasCommitRange && fromCommit && toCommit) {
+    const fromIdx = graphqlMeta.commits.findIndex((c) => c.oid === fromCommit);
+    let rangeBaseOid = fromIdx >= 0 ? graphqlMeta.commits[fromIdx]?.parentOid : undefined;
+    if (!rangeBaseOid && fromIdx > 0) {
+      rangeBaseOid = graphqlMeta.commits[fromIdx - 1]?.oid;
+    }
+    if (!rangeBaseOid) {
+      const parentRes = await git(repoRoot, ["rev-parse", "--verify", "--quiet", `${fromCommit}^`]);
+      rangeBaseOid = parentRes.ok && parentRes.stdout.trim() ? parentRes.stdout.trim() : meta.baseRefOid;
+    }
+    const rangeHeadOid = toCommit;
+    try {
+      const localRange = await readRangeFiles(directory, rangeBaseOid, rangeHeadOid, false);
+      return {
+        pullRequestNodeId: graphqlMeta.pullRequestNodeId,
+        commits: graphqlMeta.commits,
+        baseRefName: meta.baseRefName,
+        baseRefOid: rangeBaseOid,
+        headRefName: meta.headRefName,
+        headRefOid: rangeHeadOid,
+        files: attachViewed(localRange.files)
+      };
+    } catch {
+      const compareRes = await execGh(repoRoot, [
+        "api",
+        `repos/{owner}/{repo}/compare/${rangeBaseOid}...${rangeHeadOid}`
+      ]);
+      if (compareRes.ok && compareRes.stdout.trim()) {
+        const compareData = JSON.parse(compareRes.stdout);
+        return {
+          pullRequestNodeId: graphqlMeta.pullRequestNodeId,
+          commits: graphqlMeta.commits,
+          baseRefName: meta.baseRefName,
+          baseRefOid: rangeBaseOid,
+          headRefName: meta.headRefName,
+          headRefOid: rangeHeadOid,
+          files: attachViewed((compareData.files ?? []).map((f) => ({
+            path: f.filename,
+            previousPath: f.previous_filename,
+            status: mapGithubFileStatus(f.status),
+            insertions: f.additions,
+            deletions: f.deletions
+          })))
+        };
+      }
+      throw new Error(`Failed to load files for commit range ${fromCommit.slice(0, 8)}..${toCommit.slice(0, 8)}`);
+    }
+  }
+  if (filesRes?.ok && filesRes.stdout.trim()) {
     try {
       const parsed = JSON.parse(filesRes.stdout);
       const rawFiles = Array.isArray(parsed[0]) ? parsed.flat() : parsed;
       return {
         ...meta,
-        files: rawFiles.map((f) => ({
+        pullRequestNodeId: graphqlMeta.pullRequestNodeId,
+        commits: graphqlMeta.commits,
+        files: attachViewed(rawFiles.map((f) => ({
           path: f.filename,
           previousPath: f.previous_filename,
           status: mapGithubFileStatus(f.status),
           insertions: f.additions,
           deletions: f.deletions
-        }))
+        })))
       };
     } catch {}
   }
@@ -967,10 +1194,12 @@ var readPullRequestFiles = async (directory, prNumber) => {
     const localRange = await readRangeFiles(directory, meta.baseRefOid, meta.headRefOid, false);
     return {
       ...meta,
-      files: localRange.files
+      pullRequestNodeId: graphqlMeta.pullRequestNodeId,
+      commits: graphqlMeta.commits,
+      files: attachViewed(localRange.files)
     };
   }
-  throw new Error(filesRes.stderr.trim() || `Failed to load files for PR #${prNumber}`);
+  throw new Error(filesRes?.stderr.trim() || `Failed to load files for PR #${prNumber}`);
 };
 var fetchGithubRawFileBuffer = async (repoRoot, filePath, refOid) => {
   if (!SHA_RE.test(refOid))
@@ -1394,6 +1623,24 @@ var sendJson = (res, status, body) => {
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify(body));
 };
+var readJsonBody = (req) => new Promise((resolve, reject) => {
+  let raw = "";
+  req.setEncoding("utf8");
+  req.on("data", (chunk) => {
+    raw += chunk;
+    if (raw.length > 64 * 1024) {
+      reject(new Error("Request body too large"));
+    }
+  });
+  req.on("end", () => {
+    try {
+      resolve(raw.trim() ? JSON.parse(raw) : {});
+    } catch (err) {
+      reject(err);
+    }
+  });
+  req.on("error", reject);
+});
 var server = http.createServer((req, res) => {
   if (req.headers.authorization !== `Bearer ${token}`) {
     sendJson(res, 401, { error: "unauthorized" });
@@ -1407,6 +1654,31 @@ var server = http.createServer((req, res) => {
         difftAvailable: Boolean(info.bin),
         difftVersion: info.version,
         ghAvailable: Boolean(getGhBinary())
+      });
+    });
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/pr-file-viewed") {
+    readJsonBody(req).then(async (body) => {
+      const directory = typeof body.directory === "string" ? body.directory : "";
+      const pullRequestNodeId = typeof body.pullRequestNodeId === "string" ? body.pullRequestNodeId : "";
+      const filePath = typeof body.path === "string" ? body.path : "";
+      const viewed = Boolean(body.viewed);
+      if (!path.isAbsolute(directory)) {
+        sendJson(res, 400, { error: "bad-request", message: "Absolute directory is required" });
+        return;
+      }
+      const data = await setPullRequestFileViewed({
+        directory,
+        pullRequestNodeId,
+        filePath,
+        viewed
+      });
+      sendJson(res, 200, data);
+    }).catch((err) => {
+      sendJson(res, 500, {
+        error: "service-error",
+        message: err instanceof Error ? err.message : String(err)
       });
     });
     return;
@@ -1463,7 +1735,9 @@ var server = http.createServer((req, res) => {
     }
     if (url.pathname === "/pr-files") {
       const number = Number.parseInt(url.searchParams.get("number") ?? "0", 10);
-      const data = await readPullRequestFiles(directory, number);
+      const fromCommit = url.searchParams.get("fromCommit") || undefined;
+      const toCommit = url.searchParams.get("toCommit") || undefined;
+      const data = await readPullRequestFiles(directory, number, fromCommit, toCommit);
       sendJson(res, 200, data);
       return;
     }

@@ -8,10 +8,12 @@ import {
   BranchTargetSelector,
   CommitComparisonSelector,
   PullRequestComparisonSelector,
+  PullRequestCommitRangeSelector,
   NestedRepoPicker,
   DiffViewToggle,
   ToolbarIconButton,
   type BranchTargetValue,
+  type PrCommitRangeValue,
 } from './Selectors';
 import {
   PierreDiffViewer,
@@ -43,11 +45,13 @@ import type {
   GitDirectoriesResponse,
   GitLogEntry,
   GitPathUnavailableReason,
+  GitPullRequestCommit,
   GitPullRequestEntry,
   GitPullRequestFile,
   GitRangeFile,
   GitStatusResponse,
   GitSubmoduleState,
+  PrFileViewedState,
   ServiceFileDiffResponse,
 } from './types';
 
@@ -477,12 +481,15 @@ const FileList = React.memo<FileListProps>(
           {changedFiles.map((file) => {
             const descriptor = describeChange(file, scope);
             const isActive = selectedFile === file.path;
+            const isViewed = file.viewedState === 'VIEWED';
             return (
               <li key={file.path}>
                 <button
                   type="button"
                   onClick={() => onSelectFile(file.path)}
-                  className={`oc-file-row ${isActive ? 'oc-file-row--active' : ''}`}
+                  className={`oc-file-row ${isActive ? 'oc-file-row--active' : ''} ${
+                    isViewed ? 'oc-file-row--viewed' : ''
+                  }`}
                   title={file.path}
                 >
                   <Icon name="file-code" className="oc-icon-sm oc-shrink-0" />
@@ -499,6 +506,13 @@ const FileList = React.memo<FileListProps>(
                   >
                     {file.path}
                   </span>
+                  {isViewed ? (
+                    <Icon
+                      name="check"
+                      className="oc-icon-sm oc-shrink-0"
+                      style={{ color: 'var(--status-success)' }}
+                    />
+                  ) : null}
                   {formatDiffTotals(file.insertions, file.deletions)}
                 </button>
               </li>
@@ -567,19 +581,29 @@ const FileTree = React.memo<FileListProps>(
 
             const descriptor = describeChange(row.file, scope);
             const isActive = selectedFile === row.file.path;
+            const isViewed = row.file.viewedState === 'VIEWED';
             return (
               <li key={row.key} className="oc-tree-li">
                 <button
                   type="button"
                   onClick={() => onSelectFile(row.file.path)}
                   aria-current={isActive ? 'true' : undefined}
-                  className={`oc-tree-row ${isActive ? 'oc-tree-row--active' : ''}`}
+                  className={`oc-tree-row ${isActive ? 'oc-tree-row--active' : ''} ${
+                    isViewed ? 'oc-tree-row--viewed' : ''
+                  }`}
                   style={{ paddingInlineStart: `${paddingLeft}px` }}
                   title={row.file.path}
                 >
                   <Icon name="file-code" className="oc-icon-sm oc-shrink-0" />
                   <span className="oc-tree-row-name">{row.name}</span>
                   <span className="oc-tree-row-end">
+                    {isViewed ? (
+                      <Icon
+                        name="check"
+                        className="oc-icon-sm oc-shrink-0"
+                        style={{ color: 'var(--status-success)' }}
+                      />
+                    ) : null}
                     <span
                       className="oc-status-letter"
                       style={{ color: descriptor.color }}
@@ -649,6 +673,7 @@ interface MultiFileDiffEntryProps {
   fetchFileDiff: (file: FileEntry) => Promise<ServiceFileDiffResponse>;
   serviceGet: <T>(path: string, query: Record<string, string>) => Promise<T>;
   onSelectRepository?: (repoPath: string) => void;
+  onToggleViewed?: (filePath: string, viewed: boolean) => void;
   requestKeyPrefix: string;
   onDiffLoaded?: (path: string, fileDiff: FileDiffMetadata | null) => void;
 }
@@ -674,6 +699,7 @@ const MultiFileDiffEntry = React.memo<MultiFileDiffEntryProps>(
     fetchFileDiff,
     serviceGet,
     onSelectRepository,
+    onToggleViewed,
     requestKeyPrefix,
     onDiffLoaded,
   }) => {
@@ -861,6 +887,33 @@ const MultiFileDiffEntry = React.memo<MultiFileDiffEntryProps>(
               </span>
             </div>
             <div className="oc-diff-entry-header-right">
+              {scope === 'pr' && file.viewedState === 'DISMISSED' ? (
+                <span className="oc-viewed-dismissed-badge" title="Changed since last viewed">
+                  Changed since viewed
+                </span>
+              ) : null}
+              {scope === 'pr' && onToggleViewed ? (
+                <button
+                  type="button"
+                  role="checkbox"
+                  aria-checked={file.viewedState === 'VIEWED'}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onToggleViewed(file.path, file.viewedState !== 'VIEWED');
+                  }}
+                  className={`oc-viewed-toggle ${
+                    file.viewedState === 'VIEWED' ? 'oc-viewed-toggle--checked' : ''
+                  }`}
+                  title="Mark file as viewed on GitHub"
+                >
+                  <span className="oc-viewed-checkbox">
+                    {file.viewedState === 'VIEWED' ? (
+                      <Icon name="check" className="oc-icon-sm" />
+                    ) : null}
+                  </span>
+                  <span>Viewed</span>
+                </button>
+              ) : null}
               {languageLabel && languageLabel !== 'Text' ? (
                 <span className="oc-difft-lang-badge" title={`Difftastic language: ${languageLabel}`}>
                   {languageLabel}
@@ -1153,11 +1206,16 @@ export const DiffView: React.FC<DiffViewProps> = ({
   const [prsLoading, setPrsLoading] = useState(false);
   const [prsError, setPrsError] = useState<string | null>(null);
   const [selectedPrNumber, setSelectedPrNumber] = useState<number | null>(null);
+  const [prCommitRanges, setPrCommitRanges] = useState<Record<string, PrCommitRangeValue>>({});
+  const [viewedOverrides, setViewedOverrides] = useState<Record<string, PrFileViewedState>>({});
   const commitsRequestSeqRef = useRef(0);
   const prsRequestSeqRef = useRef(0);
   const [prFilesState, setPrFilesState] = useState<{
     key: string;
+    prLookupKey: string;
+    pullRequestNodeId: string | null;
     files: GitPullRequestFile[];
+    commits: GitPullRequestCommit[];
     baseRefOid: string;
     headRefOid: string;
   } | null>(null);
@@ -1647,15 +1705,35 @@ export const DiffView: React.FC<DiffViewProps> = ({
     };
   }, [activeScope, commitScopeKey, effectiveDirectory, selectedCommitHash, serviceGet]);
 
-  const prScopeKey =
+  const prRangeLookupKey =
     effectiveDirectory && selectedPrNumber ? `${effectiveDirectory}::pr:${selectedPrNumber}` : null;
+  const activePrCommitRange: PrCommitRangeValue = prRangeLookupKey
+    ? prCommitRanges[prRangeLookupKey] ?? null
+    : null;
+  const prScopeKey = prRangeLookupKey
+    ? `${prRangeLookupKey}::${
+        activePrCommitRange
+          ? `${activePrCommitRange.fromOid}..${activePrCommitRange.toOid}`
+          : 'all'
+      }`
+    : null;
   const activePrFilesState =
     prScopeKey && prFilesState?.key === prScopeKey ? prFilesState : null;
+  const currentPrMetaState =
+    prRangeLookupKey && prFilesState?.prLookupKey === prRangeLookupKey ? prFilesState : null;
   const prFiles = activePrFilesState?.files ?? null;
+  const prCommits = currentPrMetaState?.commits ?? [];
+  const pullRequestNodeId = currentPrMetaState?.pullRequestNodeId ?? null;
 
-  // Fetch files for selected PR
+  // Fetch files for selected PR (and optional commit range)
   useEffect(() => {
-    if (activeScope !== 'pr' || !effectiveDirectory || !selectedPrNumber || !prScopeKey) {
+    if (
+      activeScope !== 'pr' ||
+      !effectiveDirectory ||
+      !selectedPrNumber ||
+      !prScopeKey ||
+      !prRangeLookupKey
+    ) {
       setPrFilesError(null);
       return;
     }
@@ -1663,19 +1741,43 @@ export const DiffView: React.FC<DiffViewProps> = ({
     setPrFilesLoading(true);
     setPrFilesError(null);
 
-    serviceGet<{
-      files: GitPullRequestFile[];
-      baseRefOid: string;
-      headRefOid: string;
-    }>('/pr-files', {
+    const query: Record<string, string> = {
       directory: effectiveDirectory,
       number: String(selectedPrNumber),
-    })
+    };
+    if (activePrCommitRange) {
+      query.fromCommit = activePrCommitRange.fromOid;
+      query.toCommit = activePrCommitRange.toOid;
+    }
+
+    serviceGet<{
+      pullRequestNodeId: string | null;
+      files: GitPullRequestFile[];
+      commits: GitPullRequestCommit[];
+      baseRefOid: string;
+      headRefOid: string;
+    }>('/pr-files', query)
       .then((res) => {
         if (cancelled) return;
+        setViewedOverrides((prev) => {
+          const prefix = `${prRangeLookupKey}::`;
+          let changed = false;
+          const next: Record<string, PrFileViewedState> = {};
+          for (const [k, v] of Object.entries(prev)) {
+            if (k.startsWith(prefix)) {
+              changed = true;
+            } else {
+              next[k] = v;
+            }
+          }
+          return changed ? next : prev;
+        });
         setPrFilesState({
           key: prScopeKey,
+          prLookupKey: prRangeLookupKey,
+          pullRequestNodeId: res.pullRequestNodeId ?? null,
           files: res.files,
+          commits: res.commits ?? [],
           baseRefOid: res.baseRefOid,
           headRefOid: res.headRefOid,
         });
@@ -1690,7 +1792,16 @@ export const DiffView: React.FC<DiffViewProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [activeScope, effectiveDirectory, prScopeKey, refreshTick, selectedPrNumber, serviceGet]);
+  }, [
+    activePrCommitRange,
+    activeScope,
+    effectiveDirectory,
+    prRangeLookupKey,
+    prScopeKey,
+    refreshTick,
+    selectedPrNumber,
+    serviceGet,
+  ]);
 
   const workingFileCount = useMemo(
     () => (status?.files ? status.files.filter(isWorkingStatusFile).length : 0),
@@ -1704,15 +1815,21 @@ export const DiffView: React.FC<DiffViewProps> = ({
 
   const changedFiles = useMemo<FileEntry[]>(() => {
     if (activeScope === 'pr') {
-      return (prFiles ?? []).map((f) => ({
-        path: f.path,
-        previousPath: f.previousPath,
-        index: '',
-        working_dir: f.status,
-        insertions: f.insertions,
-        deletions: f.deletions,
-        isNew: f.status === 'A',
-      }));
+      return (prFiles ?? []).map((f) => {
+        const overrideKey = prRangeLookupKey ? `${prRangeLookupKey}::${f.path}` : null;
+        const viewedState =
+          (overrideKey ? viewedOverrides[overrideKey] : undefined) ?? f.viewedState;
+        return {
+          path: f.path,
+          previousPath: f.previousPath,
+          index: '',
+          working_dir: f.status,
+          insertions: f.insertions,
+          deletions: f.deletions,
+          isNew: f.status === 'A',
+          viewedState,
+        };
+      });
     }
     if (activeScope === 'commit') {
       return (commitFiles ?? []).map((f) => ({
@@ -1761,7 +1878,7 @@ export const DiffView: React.FC<DiffViewProps> = ({
         };
       })
       .sort((a, b) => a.path.localeCompare(b.path));
-  }, [activeScope, branchFiles, commitFiles, prFiles, status]);
+  }, [activeScope, branchFiles, commitFiles, prFiles, prRangeLookupKey, status, viewedOverrides]);
 
   const filesSettled =
     activeScope === 'pr'
@@ -1782,17 +1899,30 @@ export const DiffView: React.FC<DiffViewProps> = ({
     const paths = changedPathsKey ? changedPathsKey.split('\0') : [];
     const pathSet = new Set(paths);
     const scopeKey = `${effectiveDirectory ?? ''}:${activeScope}:${
-      activeScope === 'branch' ? `${qualifiedBranchBase ?? ''}:${branchHeadRef}:${branchIncludeWorkingTree}` : ''
+      activeScope === 'branch'
+        ? `${qualifiedBranchBase ?? ''}:${branchHeadRef}:${branchIncludeWorkingTree}`
+        : ''
     }:${activeScope === 'commit' ? selectedCommitHash ?? '' : ''}:${
-      activeScope === 'pr' ? selectedPrNumber ?? '' : ''
+      activeScope === 'pr'
+        ? `${selectedPrNumber ?? ''}:${
+            activePrCommitRange
+              ? `${activePrCommitRange.fromOid}..${activePrCommitRange.toOid}`
+              : 'all'
+          }`
+        : ''
     }`;
     const shouldInit = stackedScopeRef.current !== scopeKey;
     stackedScopeRef.current = scopeKey;
 
     setExpandedFiles((prev) => {
       if (shouldInit) {
-        const count = getStackedViewDefaultExpandedCount(paths.length);
-        return new Set(paths.slice(0, count));
+        // In PR scope, files already marked VIEWED start collapsed by default
+        const unviewedPaths =
+          activeScope === 'pr'
+            ? changedFiles.filter((f) => f.viewedState !== 'VIEWED').map((f) => f.path)
+            : paths;
+        const count = getStackedViewDefaultExpandedCount(unviewedPaths.length);
+        return new Set(unviewedPaths.slice(0, count));
       }
       const next = new Set<string>();
       for (const p of prev) {
@@ -1810,9 +1940,11 @@ export const DiffView: React.FC<DiffViewProps> = ({
       return next;
     });
   }, [
+    activePrCommitRange,
     activeScope,
     branchHeadRef,
     branchIncludeWorkingTree,
+    changedFiles,
     changedPathsKey,
     effectiveDirectory,
     filesSettled,
@@ -1993,6 +2125,48 @@ export const DiffView: React.FC<DiffViewProps> = ({
     });
   }, []);
 
+  const handleToggleFileViewed = useCallback(
+    (filePath: string, nextViewed: boolean) => {
+      if (!effectiveDirectory || !prRangeLookupKey || !pullRequestNodeId) return;
+      const overrideKey = `${prRangeLookupKey}::${filePath}`;
+      const previousFile = changedFiles.find((f) => f.path === filePath);
+      const previousState: PrFileViewedState = previousFile?.viewedState ?? 'UNVIEWED';
+      const nextState: PrFileViewedState = nextViewed ? 'VIEWED' : 'UNVIEWED';
+
+      setViewedOverrides((prev) => ({ ...prev, [overrideKey]: nextState }));
+      if (nextViewed) {
+        handleExpandedChange(filePath, false);
+      }
+
+      void host
+        .serviceRequest({
+          method: 'POST',
+          path: '/pr-file-viewed',
+          body: JSON.stringify({
+            directory: effectiveDirectory,
+            pullRequestNodeId,
+            path: filePath,
+            viewed: nextViewed,
+          }),
+        })
+        .then((res) => {
+          if (res.status < 200 || res.status >= 300) {
+            const parsed = JSON.parse(res.body) as { message?: string; error?: string };
+            throw new Error(parsed.message || parsed.error || `HTTP ${res.status}`);
+          }
+        })
+        .catch((err) => {
+          setViewedOverrides((prev) => ({ ...prev, [overrideKey]: previousState }));
+          void host.toast({
+            kind: 'error',
+            message:
+              err instanceof Error ? err.message : 'Failed to update GitHub file viewed state',
+          });
+        });
+    },
+    [changedFiles, effectiveDirectory, handleExpandedChange, host, prRangeLookupKey, pullRequestNodeId],
+  );
+
   const handleExpandOrCollapseAll = useCallback(() => {
     setExpandedFiles((prev) =>
       prev.size > 0 ? new Set() : new Set(changedFiles.map((f) => f.path)),
@@ -2060,8 +2234,10 @@ export const DiffView: React.FC<DiffViewProps> = ({
   const requestKeyPrefix = `${effectiveDirectory ?? ''}::${activeScope}::${qualifiedBranchBase ?? ''}::${branchHeadRef}::${
     branchIncludeWorkingTree ? 'wt' : 'committed'
   }::${selectedCommitHash ?? ''}::${selectedPrNumber ?? ''}::${
-    ignoreComments ? 'no-comments' : 'comments'
-  }::${refreshTick}::${lifecycleTick}`;
+    activePrCommitRange
+      ? `${activePrCommitRange.fromOid}..${activePrCommitRange.toOid}`
+      : 'all'
+  }::${ignoreComments ? 'no-comments' : 'comments'}::${refreshTick}::${lifecycleTick}`;
 
   useEffect(() => {
     loadedDiffsRef.current.clear();
@@ -2271,6 +2447,9 @@ export const DiffView: React.FC<DiffViewProps> = ({
           fetchFileDiff={fetchFileDiff}
           serviceGet={serviceGet}
           onSelectRepository={handleSelectRepository}
+          onToggleViewed={
+            activeScope === 'pr' && pullRequestNodeId ? handleToggleFileViewed : undefined
+          }
           requestKeyPrefix={requestKeyPrefix}
           onDiffLoaded={handleDiffLoaded}
         />
@@ -2474,6 +2653,21 @@ export const DiffView: React.FC<DiffViewProps> = ({
               onSelect={(pr) => setSelectedPrNumber(pr.number)}
               onRefresh={loadPullRequests}
             />
+            {prCommits.length > 0 ? (
+              <PullRequestCommitRangeSelector
+                commits={prCommits}
+                range={activePrCommitRange}
+                onSelectRange={(nextRange) => {
+                  if (!prRangeLookupKey) return;
+                  setPrCommitRanges((prev) => {
+                    const next = { ...prev };
+                    if (nextRange === null) delete next[prRangeLookupKey];
+                    else next[prRangeLookupKey] = nextRange;
+                    return next;
+                  });
+                }}
+              />
+            ) : null}
             {selectedPr?.url ? (
               <ToolbarIconButton
                 label="Open pull request in browser"

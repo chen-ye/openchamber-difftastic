@@ -402,6 +402,10 @@ export const PANEL_CSS = `
     background: var(--interactive-hover, var(--oc-hover));
   }
 
+  .oc-dropdown-item--in-range {
+    background: color-mix(in srgb, var(--interactive-selection, var(--oc-selection)) 45%, transparent);
+  }
+
   .oc-dropdown-item-check {
     width: 14px;
     display: inline-flex;
@@ -570,6 +574,18 @@ export const PANEL_CSS = `
     color: var(--interactive-selection-foreground, var(--oc-selection-fg));
   }
 
+  .oc-file-row--viewed,
+  .oc-tree-row--viewed {
+    opacity: 0.52;
+  }
+
+  .oc-file-row--viewed:hover,
+  .oc-tree-row--viewed:hover,
+  .oc-file-row--viewed.oc-file-row--active,
+  .oc-tree-row--viewed.oc-tree-row--active {
+    opacity: 1;
+  }
+
   .oc-file-row-path,
   .oc-tree-row-name {
     flex: 1 1 auto;
@@ -583,6 +599,9 @@ export const PANEL_CSS = `
     margin-left: auto;
     padding-left: 4px;
     flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
   }
 
   .oc-status-letter {
@@ -768,6 +787,61 @@ export const PANEL_CSS = `
     border-radius: calc(var(--radius, 9px) - 4px);
     background: color-mix(in srgb, var(--surface-foreground, var(--oc-fg)) 7%, transparent);
     color: var(--surface-muted-foreground, var(--oc-muted));
+    font-size: 11px;
+    font-weight: 500;
+    line-height: 16px;
+    white-space: nowrap;
+  }
+
+  .oc-viewed-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 22px;
+    padding: 0 7px;
+    border-radius: calc(var(--radius, 9px) - 3px);
+    border: 1px solid color-mix(in srgb, var(--interactive-border, var(--oc-border)) 65%, transparent);
+    background: var(--surface-background, var(--oc-bg));
+    color: var(--surface-muted-foreground, var(--oc-muted));
+    font-size: 11.5px;
+    font-weight: 500;
+    white-space: nowrap;
+  }
+
+  .oc-viewed-toggle:hover {
+    background: var(--interactive-hover, var(--oc-hover));
+    color: var(--surface-foreground, var(--oc-fg));
+  }
+
+  .oc-viewed-toggle--checked {
+    border-color: color-mix(in srgb, var(--status-success, var(--oc-success)) 55%, transparent);
+    background: color-mix(in srgb, var(--status-success, var(--oc-success)) 12%, transparent);
+    color: var(--surface-foreground, var(--oc-fg));
+  }
+
+  .oc-viewed-checkbox {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 13px;
+    height: 13px;
+    border-radius: 3px;
+    border: 1px solid color-mix(in srgb, var(--surface-foreground, var(--oc-fg)) 35%, transparent);
+  }
+
+  .oc-viewed-toggle--checked .oc-viewed-checkbox {
+    border-color: var(--status-success, var(--oc-success));
+    background: var(--status-success, var(--oc-success));
+    color: var(--surface-background, var(--oc-bg));
+  }
+
+  .oc-viewed-dismissed-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 1px 6px;
+    border-radius: calc(var(--radius, 9px) - 4px);
+    background: color-mix(in srgb, var(--status-warning, var(--oc-warning)) 16%, transparent);
+    color: var(--warning-text, var(--status-warning, var(--oc-warning)));
     font-size: 11px;
     font-weight: 500;
     line-height: 16px;

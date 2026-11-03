@@ -104,12 +104,23 @@ export interface GitPullRequestEntry {
   url: string;
 }
 
+export type PrFileViewedState = 'VIEWED' | 'UNVIEWED' | 'DISMISSED';
+
+export interface GitPullRequestCommit {
+  oid: string;
+  message: string;
+  author: string;
+  date: string;
+  parentOid?: string;
+}
+
 export interface GitPullRequestFile {
   path: string;
   previousPath?: string;
   status: string;
   insertions: number;
   deletions: number;
+  viewedState?: PrFileViewedState;
 }
 
 export interface DifftChangeToken {
@@ -159,6 +170,7 @@ export interface FileEntry {
   deletions: number;
   isNew: boolean;
   revision?: string;
+  viewedState?: PrFileViewedState;
 }
 
 export interface DifftLineSpan {
