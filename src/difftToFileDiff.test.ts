@@ -8,6 +8,7 @@ import { OPENCHAMBER_SDK_API_VERSION } from '@openchamber/sdk';
 import { adaptDifftToViewModel, byteOffsetsToCharSpans } from './difftToFileDiff';
 import { buildDiffTreeRows } from './changesTree';
 import { resolveBranchComparisonBase } from './baseBranch';
+import { chooseAutoNestedRepo, discoversNestedRepos } from './nestedRepositories';
 import type { DifftJsonFile } from './types';
 
 describe('byteOffsetsToCharSpans', () => {
@@ -321,25 +322,34 @@ describe('changesTree & baseBranch helpers', () => {
     expect(rows).toHaveLength(3);
   });
 
-  test('resolves branch comparison base in priority order', () => {
+  test('resolves branch comparison base in priority order including pullRequest base', () => {
     const resolved = resolveBranchComparisonBase(
       {
         chosen: null,
-        createdFrom: null,
+        pullRequest: 'develop',
+        createdFrom: 'main',
         defaultBranch: 'main',
       },
       {
-        localBranches: ['main', 'feat/difft'],
-        remoteBranches: ['origin/main'],
+        localBranches: ['main', 'develop', 'feat/difft'],
+        remoteBranches: ['origin/main', 'origin/develop'],
         remoteNames: new Set(['origin']),
         primaryRemote: 'origin',
         headBranch: 'feat/difft',
       },
     );
     expect(resolved).toEqual({
-      ref: 'origin/main',
-      source: 'default',
+      ref: 'origin/develop',
+      source: 'pull-request',
     });
+  });
+
+  test('chooses first non-hidden nested repository and skips home directory discovery', () => {
+    expect(
+      chooseAutoNestedRepo('/workspace', ['/workspace/.cache/repo', '/workspace/packages/app']),
+    ).toBe('/workspace/packages/app');
+    expect(discoversNestedRepos('/home/user', '/home/user')).toBe(false);
+    expect(discoversNestedRepos('/home/user/workspace', '/home/user')).toBe(true);
   });
 });
 
@@ -440,6 +450,25 @@ describe('package manifest & service integration', () => {
       expect(rangeRes.status).toBe(200);
       expect(rangeRes.body.files).toHaveLength(1);
       expect(rangeRes.body.files[0].path).toBe('math.ts');
+
+      // Create a nested git repository inside tempRepo and verify /git-dirs and nested_repository detection
+      const nestedRepo = path.join(tempRepo, 'subprojects/child-repo');
+      await fs.mkdir(nestedRepo, { recursive: true });
+      execFileSync('git', ['init', '-b', 'main', nestedRepo]);
+
+      const gitDirsRes = await getJson('/git-dirs', { directory: tempRepo });
+      expect(gitDirsRes.status).toBe(200);
+      expect(gitDirsRes.body.repositories).toEqual([
+        { path: nestedRepo, name: 'child-repo' },
+      ]);
+
+      const nestedDiffRes = await getJson('/file-diff', {
+        directory: tempRepo,
+        scope: 'working',
+        path: 'subprojects/child-repo/',
+      });
+      expect(nestedDiffRes.status).toBe(200);
+      expect(nestedDiffRes.body.unavailableReason).toBe('nested_repository');
     } finally {
       child.kill('SIGTERM');
       await fs.rm(tempRepo, { recursive: true, force: true });

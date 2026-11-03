@@ -9,8 +9,10 @@ export type IconName =
   | 'expand-up-down'
   | 'file-code'
   | 'file-text'
+  | 'folder-3'
   | 'git-branch'
   | 'git-commit'
+  | 'git-pull-request'
   | 'layout-column'
   | 'loader-4'
   | 'node-tree'
@@ -74,6 +76,12 @@ export const Icon: React.FC<{
           <path d="M21 8V20.9932C21 21.5501 20.5552 22 20.0066 22H3.9934C3.44495 22 3 21.556 3 21.0082V2.9918C3 2.45531 3.4487 2 4.00221 2H14.9968L21 8ZM19 9H14V4H5V20H19V9ZM8 7H11V9H8V7ZM8 11H16V13H8V11ZM8 15H16V17H8V15Z" />
         </svg>
       );
+    case 'folder-3':
+      return (
+        <svg viewBox="0 0 24 24" fill="currentColor" className={className} style={style} aria-hidden="true">
+          <path d="M12.4142 5H21C21.5523 5 22 5.44772 22 6V20C22 20.5523 21.5523 21 21 21H3C2.44772 21 2 20.5523 2 20V4C2 3.44772 2.44772 3 3 3H10.4142L12.4142 5ZM4 7V19H20V7H4Z" />
+        </svg>
+      );
     case 'git-branch':
       return (
         <svg viewBox="0 0 24 24" fill="currentColor" className={className} style={style} aria-hidden="true">
@@ -84,6 +92,12 @@ export const Icon: React.FC<{
       return (
         <svg viewBox="0 0 24 24" fill="currentColor" className={className} style={style} aria-hidden="true">
           <path d="M15.874 13C15.4299 14.7252 13.8638 16 12 16C10.1362 16 8.57006 14.7252 8.12602 13H3V11H8.12602C8.57006 9.27477 10.1362 8 12 8C13.8638 8 15.4299 9.27477 15.874 11H21V13H15.874ZM12 14C13.1046 14 14 13.1046 14 12C14 10.8954 13.1046 10 12 10C10.8954 10 10 10.8954 10 12C10 13.1046 10.8954 14 12 14Z" />
+        </svg>
+      );
+    case 'git-pull-request':
+      return (
+        <svg viewBox="0 0 24 24" fill="currentColor" className={className} style={style} aria-hidden="true">
+          <path d="M15 5H17C18.6569 5 20 6.34315 20 8V15.1707C21.1652 15.5825 22 16.6938 22 18C22 19.6569 20.6569 21 19 21C17.3431 21 16 19.6569 16 18C16 16.6938 16.8348 15.5825 18 15.1707V8C18 7.44772 17.5523 7 17 7H15V9.5L11.5 6L15 2.5V5ZM5 8.82929C3.83481 8.41746 3 7.30622 3 6C3 4.34315 4.34315 3 6 3C7.65685 3 9 4.34315 9 6C9 7.30622 8.16519 8.41746 7 8.82929V15.1707C8.16519 15.5825 9 16.6938 9 18C9 19.6569 7.65685 21 6 21C4.34315 21 3 19.6569 3 18C3 16.6938 3.83481 15.5825 5 15.1707V8.82929ZM6 7C6.55228 7 7 6.55228 7 6C7 5.44772 6.55228 5 6 5C5.44772 5 5 5.44772 5 6C5 6.55228 5.44772 7 6 7ZM6 19C6.55228 19 7 18.5523 7 18C7 17.4477 6.55228 17 6 17C5.44772 17 5 17.4477 5 18C5 18.5523 5.44772 19 6 19ZM19 19C19.5523 19 20 18.5523 20 18C20 17.4477 19.5523 17 19 17C18.4477 17 18 17.4477 18 18C18 18.5523 18.4477 19 19 19Z" />
         </svg>
       );
     case 'layout-column':

@@ -1,7 +1,7 @@
 // service/main.ts
 import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
-import { existsSync, accessSync, constants as fsConstants } from "node:fs";
+import { existsSync, accessSync, statSync, constants as fsConstants } from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -35,26 +35,55 @@ var IMAGE_MIMES = {
 };
 var BINARY_SNIFF_BYTES = 8192;
 var UNTRACKED_DIR_EXPANSION_LIMIT = 500;
+var GIT_DIRS_MAX_DEPTH = 3;
+var GIT_DIRS_MAX_DIRS = 100;
+var GIT_DIRS_SKIP_LIST = new Set([
+  "node_modules",
+  "dist",
+  "build",
+  ".venv",
+  "target",
+  ".next"
+]);
+var GITLINK_MODE = "160000";
 var SHA_RE = /^[0-9a-f]{7,64}$/i;
 var isExecutable = (filePath) => {
   try {
+    const stat = statSync(filePath);
+    if (!stat.isFile())
+      return false;
+    if (process.platform === "win32")
+      return true;
     accessSync(filePath, fsConstants.X_OK);
     return true;
   } catch {
     return false;
   }
 };
-var resolveDifftBinary = () => {
+var resolveBinaryOnSystem = (binName) => {
+  const isWin = process.platform === "win32";
+  const exeName = isWin && !binName.endsWith(".exe") ? `${binName}.exe` : binName;
   const pathDirs = (process.env.PATH ?? "").split(path.delimiter).filter(Boolean);
   const home = os.homedir();
+  const user = process.env.USER || process.env.USERNAME || "";
+  const localAppData = process.env.LOCALAPPDATA || path.join(home, "AppData", "Local");
   const candidates = [
-    ...pathDirs.map((dir) => path.join(dir, "difft")),
-    "/home/linuxbrew/.linuxbrew/bin/difft",
-    "/opt/homebrew/bin/difft",
-    "/usr/local/bin/difft",
-    path.join(home, ".cargo/bin/difft"),
-    path.join(home, ".nix-profile/bin/difft"),
-    "/usr/bin/difft"
+    ...pathDirs.map((dir) => path.join(dir, exeName)),
+    ...isWin ? [
+      path.join(home, "scoop", "shims", exeName),
+      path.join(localAppData, "Microsoft", "WinGet", "Links", exeName),
+      path.join(home, ".cargo", "bin", exeName)
+    ] : [
+      path.join(home, ".local", "bin", exeName),
+      path.join(home, ".cargo", "bin", exeName),
+      path.join(home, ".nix-profile", "bin", exeName),
+      ...user ? [`/etc/profiles/per-user/${user}/bin/${exeName}`] : [],
+      `/run/current-system/sw/bin/${exeName}`,
+      `/opt/homebrew/bin/${exeName}`,
+      `/home/linuxbrew/.linuxbrew/bin/${exeName}`,
+      `/usr/local/bin/${exeName}`,
+      `/usr/bin/${exeName}`
+    ]
   ];
   for (const candidate of candidates) {
     if (existsSync(candidate) && isExecutable(candidate)) {
@@ -63,11 +92,13 @@ var resolveDifftBinary = () => {
   }
   return null;
 };
-var cachedDifftBin;
+var cachedDifftBin = null;
 var cachedDifftVersion = null;
+var cachedGhBin = null;
 var getDifftInfo = async () => {
-  if (cachedDifftBin === undefined) {
-    cachedDifftBin = resolveDifftBinary();
+  if (!cachedDifftBin || !isExecutable(cachedDifftBin)) {
+    cachedDifftBin = resolveBinaryOnSystem("difft");
+    cachedDifftVersion = null;
     if (cachedDifftBin) {
       cachedDifftVersion = await new Promise((resolve) => {
         execFile(cachedDifftBin, ["--version"], { timeout: 3000 }, (err, stdout) => {
@@ -82,6 +113,12 @@ var getDifftInfo = async () => {
     }
   }
   return { bin: cachedDifftBin, version: cachedDifftVersion };
+};
+var getGhBinary = () => {
+  if (!cachedGhBin || !isExecutable(cachedGhBin)) {
+    cachedGhBin = resolveBinaryOnSystem("gh");
+  }
+  return cachedGhBin;
 };
 var git = (cwd, args, extraEnv) => new Promise((resolve) => {
   execFile("git", ["-C", cwd, ...args], {
@@ -124,6 +161,57 @@ var gitBuffer = (cwd, args) => new Promise((resolve) => {
     resolve(stdout);
   });
 });
+var execGh = (cwd, args) => {
+  const bin = getGhBinary();
+  if (!bin) {
+    return Promise.resolve({ ok: false, stdout: "", stderr: "gh binary not found" });
+  }
+  return new Promise((resolve) => {
+    execFile(bin, args, {
+      cwd,
+      timeout: 15000,
+      maxBuffer: 16 * 1024 * 1024,
+      env: {
+        ...process.env,
+        GH_PROMPT_DISABLED: "1"
+      }
+    }, (error, stdout, stderr) => {
+      if (!error) {
+        resolve({ ok: true, stdout, stderr });
+        return;
+      }
+      resolve({
+        ok: false,
+        stdout: stdout ?? "",
+        stderr: stderr ?? "",
+        code: "code" in error ? error.code : undefined
+      });
+    });
+  });
+};
+var execGhBuffer = (cwd, args) => {
+  const bin = getGhBinary();
+  if (!bin)
+    return Promise.resolve(null);
+  return new Promise((resolve) => {
+    execFile(bin, args, {
+      cwd,
+      timeout: 15000,
+      maxBuffer: 32 * 1024 * 1024,
+      encoding: "buffer",
+      env: {
+        ...process.env,
+        GH_PROMPT_DISABLED: "1"
+      }
+    }, (error, stdout) => {
+      if (error || !Buffer.isBuffer(stdout)) {
+        resolve(null);
+        return;
+      }
+      resolve(stdout);
+    });
+  });
+};
 var isImagePath = (filePath) => {
   const ext = path.extname(filePath).slice(1).toLowerCase();
   return IMAGE_EXTENSIONS.has(ext);
@@ -178,6 +266,130 @@ var readWorkingTreeBuffer = async (repoRoot, absPath) => {
   } catch {
     return null;
   }
+};
+var findGitDirectories = async (rootPath) => {
+  const homeDirectory = os.homedir();
+  const normalizedRoot = rootPath.replace(/[\\/]+$/, "");
+  const normalizedHome = homeDirectory.replace(/[\\/]+$/, "");
+  if (normalizedRoot === normalizedHome) {
+    return { path: rootPath, homeDirectory, repositories: [] };
+  }
+  const results = [];
+  const walkedRealPaths = new Set;
+  const queue = [{ dir: rootPath, depth: 0 }];
+  let visited = 0;
+  const scanDirectory = async (dir, depth) => {
+    let realPath;
+    try {
+      realPath = await fs.realpath(dir);
+    } catch (error) {
+      if (dir === rootPath)
+        throw error;
+      return;
+    }
+    if (walkedRealPaths.has(realPath))
+      return;
+    walkedRealPaths.add(realPath);
+    let dirents;
+    try {
+      dirents = await fs.readdir(dir, { withFileTypes: true });
+    } catch (error) {
+      if (dir === rootPath)
+        throw error;
+      return;
+    }
+    visited += 1;
+    let isRepoBoundary = false;
+    const subdirectories = [];
+    for (const dirent of dirents) {
+      if (dirent.name === ".git") {
+        isRepoBoundary = true;
+        continue;
+      }
+      if (!dirent.isDirectory() && !dirent.isSymbolicLink())
+        continue;
+      if (GIT_DIRS_SKIP_LIST.has(dirent.name))
+        continue;
+      if (depth >= GIT_DIRS_MAX_DEPTH)
+        continue;
+      if (dirent.isSymbolicLink()) {
+        const target = await fs.stat(path.join(dir, dirent.name)).catch(() => null);
+        if (!target?.isDirectory())
+          continue;
+      }
+      subdirectories.push(dirent.name);
+    }
+    if (isRepoBoundary && dir !== rootPath) {
+      results.push(dir);
+      return;
+    }
+    subdirectories.sort();
+    for (const name of subdirectories) {
+      queue.push({ dir: path.join(dir, name), depth: depth + 1 });
+    }
+  };
+  for (let index = 0;index < queue.length && visited < GIT_DIRS_MAX_DIRS; index += 1) {
+    const item = queue[index];
+    if (!item)
+      break;
+    await scanDirectory(item.dir, item.depth);
+  }
+  return {
+    path: rootPath,
+    homeDirectory,
+    repositories: results.map((repoPath) => ({
+      path: repoPath,
+      name: path.basename(repoPath)
+    }))
+  };
+};
+var readGitEntryInfo = async (repoRoot, args, repoPath) => {
+  const res = await git(repoRoot, args);
+  if (!res.ok)
+    return null;
+  for (const record of res.stdout.split("\x00")) {
+    const tab = record.indexOf("\t");
+    if (tab !== -1 && record.slice(tab + 1) === repoPath) {
+      const meta = record.slice(0, tab).trim().split(/\s+/);
+      const mode = meta[0] ?? "";
+      const hash = meta.length >= 3 && (meta[1] === "blob" || meta[1] === "commit" || meta[1] === "tree") ? meta[2] ?? "" : meta[1] ?? "";
+      return { mode, hash };
+    }
+  }
+  return null;
+};
+var readGitEntryMode = async (repoRoot, args, repoPath) => {
+  const info = await readGitEntryInfo(repoRoot, args, repoPath);
+  return info?.mode ?? null;
+};
+var readSubmoduleState = async (repoRoot, repoPath, absPath) => {
+  const status = await git(repoRoot, [
+    "status",
+    "--porcelain=v2",
+    "-z",
+    "--",
+    `:(literal)${repoPath}`
+  ]);
+  const record = status.ok ? status.stdout.split("\x00").find((entry) => /^[12u] /.test(entry))?.split(" ") : undefined;
+  const hasConflict = record?.[0] === "u";
+  const readHead = async () => {
+    const r = await git(repoRoot, ["rev-parse", "--verify", "--quiet", `HEAD:${repoPath}`]);
+    return r.ok ? r.stdout.trim() : "";
+  };
+  const head = record && !hasConflict ? record[6] ?? "" : await readHead();
+  const index = hasConflict ? "" : record ? record[7] ?? "" : head;
+  const flags = record ? record[2] ?? "S..." : "S...";
+  const initialized = await fs.lstat(path.join(absPath, ".git")).then(() => true).catch(() => false);
+  const worktree = initialized ? await git(absPath, ["rev-parse", "--verify", "HEAD"]) : null;
+  const commitOrNull = (val) => val && !/^0+$/.test(val) ? val : null;
+  return {
+    headCommit: commitOrNull(head),
+    indexCommit: commitOrNull(index),
+    worktreeCommit: worktree?.ok ? worktree.stdout.trim() : null,
+    hasTrackedChanges: flags[2] === "M",
+    hasUntrackedFiles: flags[3] === "U",
+    hasConflict
+  };
 };
 var parseNumstatZ = (raw) => {
   const stats = {};
@@ -255,11 +467,13 @@ var detectCreatedFromBase = async (repoRoot, branchName, remotes) => {
 };
 var readStatus = async (directory) => {
   const difftInfo = await getDifftInfo();
+  const homeDirectory = os.homedir();
   const top = await git(directory, ["rev-parse", "--show-toplevel"]);
   if (!top.ok || !top.stdout.trim()) {
     return {
       isGitRepo: false,
       repoRoot: null,
+      homeDirectory,
       current: null,
       files: [],
       diffStats: { staged: {}, working: {} },
@@ -270,8 +484,17 @@ var readStatus = async (directory) => {
     };
   }
   const repoRoot = top.stdout.trim();
-  const [branchRes, porcelainRes, stagedNumstatRes, workingNumstatRes, refsRes, remotesRes] = await Promise.all([
+  const [
+    branchRes,
+    headVerifyRes,
+    porcelainRes,
+    stagedNumstatRes,
+    workingNumstatRes,
+    refsRes,
+    remotesRes
+  ] = await Promise.all([
     git(repoRoot, ["symbolic-ref", "--short", "-q", "HEAD"]),
+    git(repoRoot, ["rev-parse", "--verify", "--quiet", "HEAD"]),
     git(repoRoot, ["status", "--porcelain=v1", "-z", "-unormal"]),
     git(repoRoot, ["diff", "--cached", "-M", "--numstat", "-z"]),
     git(repoRoot, ["diff-files", "-M", "--numstat", "-z"]),
@@ -281,6 +504,7 @@ var readStatus = async (directory) => {
   if (!porcelainRes.ok) {
     throw new Error(porcelainRes.stderr.trim() || "git status failed");
   }
+  const unborn = !headVerifyRes.ok || !headVerifyRes.stdout.trim();
   const current = branchRes.ok ? branchRes.stdout.trim() || "HEAD" : "HEAD";
   const stagedStats = stagedNumstatRes.ok ? parseNumstatZ(stagedNumstatRes.stdout) : {};
   const workingStats = workingNumstatRes.ok ? parseNumstatZ(workingNumstatRes.stdout) : {};
@@ -298,20 +522,24 @@ var readStatus = async (directory) => {
     if (!filePath)
       continue;
     if (indexChar === "?" && workingChar === "?" && filePath.endsWith("/")) {
-      const expanded = await git(repoRoot, [
-        "ls-files",
-        "--others",
-        "--exclude-standard",
-        "-z",
-        "--",
-        filePath
-      ]);
-      const subPaths = expanded.ok ? expanded.stdout.split("\x00").filter(Boolean) : [];
-      if (subPaths.length > 0 && subPaths.length <= UNTRACKED_DIR_EXPANSION_LIMIT) {
-        for (const sub of subPaths) {
-          files.push({ path: sub, index: "?", working_dir: "?" });
+      const absDir = path.join(repoRoot, filePath);
+      const hasDotGit = await fs.lstat(path.join(absDir, ".git")).then(() => true).catch(() => false);
+      if (!hasDotGit) {
+        const expanded = await git(repoRoot, [
+          "ls-files",
+          "--others",
+          "--exclude-standard",
+          "-z",
+          "--",
+          filePath
+        ]);
+        const subPaths = expanded.ok ? expanded.stdout.split("\x00").filter(Boolean) : [];
+        if (subPaths.length > 0 && subPaths.length <= UNTRACKED_DIR_EXPANSION_LIMIT) {
+          for (const sub of subPaths) {
+            files.push({ path: sub, index: "?", working_dir: "?" });
+          }
+          continue;
         }
-        continue;
       }
     }
     const item = {
@@ -374,7 +602,9 @@ var readStatus = async (directory) => {
   const createdFromBase = await detectCreatedFromBase(repoRoot, current, remotes);
   return {
     isGitRepo: true,
+    unborn,
     repoRoot,
+    homeDirectory,
     current,
     files,
     diffStats: {
@@ -408,16 +638,29 @@ var readRangeFiles = async (directory, baseRef, headRef, includeWorkingTree) => 
   if (!top.ok || !top.stdout.trim())
     throw new Error("Not a git repository");
   const repoRoot = top.stdout.trim();
-  const mergeBaseRes = await git(repoRoot, ["merge-base", baseRef, headRef]);
+  const [mergeBaseRes, headCommitRes] = await Promise.all([
+    git(repoRoot, ["merge-base", baseRef, headRef]),
+    git(repoRoot, ["rev-parse", "--verify", "--quiet", headRef])
+  ]);
   if (!mergeBaseRes.ok || !mergeBaseRes.stdout.trim()) {
     throw new Error(`Could not resolve merge-base between ${baseRef} and ${headRef}`);
   }
   const mergeBase = mergeBaseRes.stdout.trim();
+  const headSha = headCommitRes.ok ? headCommitRes.stdout.trim() : headRef;
   let nameStatusRaw = "";
   let numstatRaw = "";
   if (includeWorkingTree) {
     const untrackedRes = await git(repoRoot, ["ls-files", "--others", "--exclude-standard", "-z"]);
-    const untracked = untrackedRes.ok ? untrackedRes.stdout : "";
+    const rawUntrackedPaths = untrackedRes.ok ? untrackedRes.stdout.split("\x00").filter(Boolean) : [];
+    const filteredUntracked = [];
+    for (const rel of rawUntrackedPaths) {
+      const abs = path.join(repoRoot, rel);
+      const hasDotGit = await fs.lstat(path.join(abs, ".git")).then(() => true).catch(() => false);
+      if (!hasDotGit) {
+        filteredUntracked.push(rel);
+      }
+    }
+    const untracked = filteredUntracked.length > 0 ? `${filteredUntracked.join("\x00")}\x00` : "";
     if (untracked) {
       const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "oc-difft-idx-"));
       try {
@@ -486,7 +729,7 @@ var readRangeFiles = async (directory, baseRef, headRef, includeWorkingTree) => 
   }
   const files = await Promise.all(rawFiles.map(async (f) => {
     const st = statsMap[f.path];
-    const sig = includeWorkingTree ? `${mergeBase}:${await readFileSignature(path.join(repoRoot, f.path))}` : mergeBase;
+    const sig = includeWorkingTree ? `${mergeBase}:${await readFileSignature(path.join(repoRoot, f.path))}` : `${mergeBase}:${headSha}`;
     return {
       ...f,
       insertions: st?.insertions ?? 0,
@@ -609,28 +852,165 @@ var readCommitFiles = async (directory, commitHash) => {
   }
   return { files };
 };
-var runDifftJson = async (filePath, original, modified, ignoreComments) => {
+var readPullRequests = async (directory) => {
+  const bin = getGhBinary();
+  if (!bin) {
+    return {
+      available: false,
+      prs: [],
+      error: "GitHub CLI (gh) not found on PATH"
+    };
+  }
+  const top = await git(directory, ["rev-parse", "--show-toplevel"]);
+  if (!top.ok || !top.stdout.trim())
+    return { available: false, prs: [] };
+  const repoRoot = top.stdout.trim();
+  const res = await execGh(repoRoot, [
+    "pr",
+    "list",
+    "--state",
+    "all",
+    "--limit",
+    "30",
+    "--json",
+    "number,title,state,isDraft,headRefName,baseRefName,headRefOid,author,url"
+  ]);
+  if (!res.ok) {
+    return {
+      available: false,
+      prs: [],
+      error: res.stderr.trim() || "Could not list pull requests via gh"
+    };
+  }
+  try {
+    const raw = JSON.parse(res.stdout);
+    return {
+      available: true,
+      prs: raw.map((item) => ({
+        number: item.number,
+        title: item.title,
+        state: item.state.toLowerCase(),
+        isDraft: Boolean(item.isDraft),
+        headRefName: item.headRefName,
+        baseRefName: item.baseRefName,
+        headRefOid: item.headRefOid,
+        author: item.author?.login ?? "unknown",
+        url: item.url
+      }))
+    };
+  } catch (err) {
+    return {
+      available: false,
+      prs: [],
+      error: err instanceof Error ? err.message : String(err)
+    };
+  }
+};
+var mapGithubFileStatus = (status) => {
+  switch (status.toLowerCase()) {
+    case "added":
+      return "A";
+    case "removed":
+      return "D";
+    case "renamed":
+      return "R";
+    case "copied":
+      return "C";
+    default:
+      return "M";
+  }
+};
+var readPullRequestFiles = async (directory, prNumber) => {
+  if (!Number.isInteger(prNumber) || prNumber <= 0) {
+    throw new Error("Valid pull request number is required");
+  }
+  const top = await git(directory, ["rev-parse", "--show-toplevel"]);
+  if (!top.ok || !top.stdout.trim())
+    throw new Error("Not a git repository");
+  const repoRoot = top.stdout.trim();
+  const [metaRes, filesRes] = await Promise.all([
+    execGh(repoRoot, [
+      "pr",
+      "view",
+      String(prNumber),
+      "--json",
+      "baseRefName,baseRefOid,headRefName,headRefOid"
+    ]),
+    execGh(repoRoot, [
+      "api",
+      "--paginate",
+      "--slurp",
+      `repos/{owner}/{repo}/pulls/${prNumber}/files?per_page=100`
+    ])
+  ]);
+  if (!metaRes.ok) {
+    throw new Error(metaRes.stderr.trim() || `Failed to load PR #${prNumber}`);
+  }
+  const meta = JSON.parse(metaRes.stdout);
+  if (filesRes.ok && filesRes.stdout.trim()) {
+    try {
+      const parsed = JSON.parse(filesRes.stdout);
+      const rawFiles = Array.isArray(parsed[0]) ? parsed.flat() : parsed;
+      return {
+        ...meta,
+        files: rawFiles.map((f) => ({
+          path: f.filename,
+          previousPath: f.previous_filename,
+          status: mapGithubFileStatus(f.status),
+          insertions: f.additions,
+          deletions: f.deletions
+        }))
+      };
+    } catch {}
+  }
+  if (SHA_RE.test(meta.baseRefOid) && SHA_RE.test(meta.headRefOid)) {
+    const localRange = await readRangeFiles(directory, meta.baseRefOid, meta.headRefOid, false);
+    return {
+      ...meta,
+      files: localRange.files
+    };
+  }
+  throw new Error(filesRes.stderr.trim() || `Failed to load files for PR #${prNumber}`);
+};
+var fetchGithubRawFileBuffer = async (repoRoot, filePath, refOid) => {
+  if (!SHA_RE.test(refOid))
+    return null;
+  const encodedPath = filePath.split("/").map((segment) => encodeURIComponent(segment)).join("/");
+  return execGhBuffer(repoRoot, [
+    "api",
+    "-H",
+    "Accept: application/vnd.github.raw",
+    `repos/{owner}/{repo}/contents/${encodedPath}?ref=${refOid}`
+  ]);
+};
+var parseDifftStdout = (out, filePath) => {
+  const trimmed = out.trim();
+  if (!trimmed)
+    return null;
+  try {
+    const parsed = JSON.parse(trimmed);
+    const items = Array.isArray(parsed) ? parsed : [parsed];
+    const matched = items.find((entry) => entry.path === filePath) ?? items[0] ?? null;
+    return matched ? { ...matched, path: filePath } : null;
+  } catch {
+    const objects = [];
+    for (const line of trimmed.split(`
+`)) {
+      const candidate = line.trim();
+      if (!candidate.startsWith("{"))
+        continue;
+      try {
+        objects.push(JSON.parse(candidate));
+      } catch {}
+    }
+    const matched = objects.find((entry) => entry.path === filePath) ?? objects[0] ?? null;
+    return matched ? { ...matched, path: filePath } : null;
+  }
+};
+var runDifftTempFiles = async (filePath, original, modified, ignoreComments) => {
   const { bin } = await getDifftInfo();
   if (!bin) {
     return { difft: null, difftError: "difft binary not found on PATH" };
-  }
-  if (original === "" && modified !== "") {
-    return {
-      difft: {
-        path: filePath,
-        language: path.extname(filePath).slice(1) || "Text",
-        status: "created"
-      }
-    };
-  }
-  if (original !== "" && modified === "") {
-    return {
-      difft: {
-        path: filePath,
-        language: path.extname(filePath).slice(1) || "Text",
-        status: "deleted"
-      }
-    };
   }
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "oc-difft-file-"));
   try {
@@ -667,27 +1047,58 @@ var runDifftJson = async (filePath, original, modified, ignoreComments) => {
     if (!output.ok || !output.stdout.trim()) {
       return { difft: null, difftError: output.stderr.trim() || "difft execution failed" };
     }
-    const parsed = JSON.parse(output.stdout.trim());
-    const item = Array.isArray(parsed) ? parsed[0] ?? null : parsed;
-    if (!item)
-      return { difft: null };
-    return {
-      difft: {
-        ...item,
-        path: filePath
-      }
-    };
-  } catch (err) {
-    return {
-      difft: null,
-      difftError: err instanceof Error ? err.message : String(err)
-    };
+    const item = parseDifftStdout(output.stdout, filePath);
+    return item ? { difft: item } : { difft: null, difftError: "Failed to parse difft JSON" };
   } finally {
     await fs.rm(tempRoot, { recursive: true, force: true });
   }
 };
+var runGitExtDifft = async (repoRoot, filePath, gitArgs, ignoreComments, allowExitCode1 = false) => {
+  const { bin } = await getDifftInfo();
+  if (!bin) {
+    return { difft: null, difftError: "difft binary not found on PATH" };
+  }
+  const extraEnv = {
+    GIT_EXTERNAL_DIFF: bin,
+    DFT_UNSTABLE: "yes",
+    DFT_DISPLAY: "json",
+    DFT_COLOR: "never"
+  };
+  if (ignoreComments) {
+    extraEnv.DFT_IGNORE_COMMENTS = "1";
+  }
+  const res = await git(repoRoot, gitArgs, extraEnv);
+  const out = res.stdout.trim();
+  if (!res.ok && !(allowExitCode1 && res.code === 1 && out)) {
+    return {
+      difft: null,
+      difftError: res.stderr.trim() || "git ext-diff execution failed"
+    };
+  }
+  if (!out) {
+    return {
+      difft: {
+        path: filePath,
+        language: "Text",
+        status: "unchanged"
+      }
+    };
+  }
+  const item = parseDifftStdout(out, filePath);
+  return item ? { difft: item } : { difft: null, difftError: "Failed to parse git ext-diff JSON output" };
+};
 var readFileDiff = async (params) => {
-  const { directory, scope, filePath, previousPath, base, head, hash, ignoreComments } = params;
+  const {
+    directory,
+    scope,
+    filePath,
+    previousPath,
+    base,
+    head,
+    hash,
+    includeWorkingTree,
+    ignoreComments
+  } = params;
   const top = await git(directory, ["rev-parse", "--show-toplevel"]);
   if (!top.ok || !top.stdout.trim())
     throw new Error("Not a git repository");
@@ -698,15 +1109,70 @@ var readFileDiff = async (params) => {
   if (previousPath && !isSafeRepoRelativePath(repoRoot, previousPath)) {
     throw new Error("Invalid previous file path");
   }
+  const repoPath = filePath.replace(/\/+$/, "");
+  const absPath = path.join(repoRoot, repoPath);
+  if (scope === "working" || scope === "staged") {
+    const [indexMode, headMode, worktreeEntry] = await Promise.all([
+      readGitEntryMode(repoRoot, ["ls-files", "--stage", "-z", "--", `:(literal)${repoPath}`], repoPath),
+      readGitEntryMode(repoRoot, ["ls-tree", "-z", "HEAD", "--", repoPath], repoPath),
+      fs.lstat(absPath).catch(() => null)
+    ]);
+    if (indexMode === GITLINK_MODE || headMode === GITLINK_MODE) {
+      const submodule = await readSubmoduleState(repoRoot, repoPath, absPath);
+      return {
+        path: filePath,
+        previousPath,
+        original: "",
+        modified: "",
+        isBinary: false,
+        isImage: false,
+        submodule,
+        difft: null
+      };
+    }
+    if (!indexMode && !headMode && worktreeEntry?.isDirectory()) {
+      const hasDotGit = await fs.lstat(path.join(absPath, ".git")).then(() => true).catch(() => false);
+      return {
+        path: filePath,
+        previousPath,
+        original: "",
+        modified: "",
+        isBinary: false,
+        isImage: false,
+        unavailableReason: hasDotGit ? "nested_repository" : "untracked_directory",
+        difft: null
+      };
+    }
+  }
   const oldPath = previousPath || filePath;
+  const oldRepoPath = oldPath.replace(/\/+$/, "");
+  const pathspecArgs = [
+    `:(literal)${filePath}`,
+    ...previousPath && previousPath !== filePath ? [`:(literal)${previousPath}`] : []
+  ];
   let oldBuf = null;
   let newBuf = null;
+  let extDiffArgs = null;
+  let extDiffAllowExit1 = false;
   if (scope === "staged") {
     oldBuf = await gitBuffer(repoRoot, ["show", `HEAD:${oldPath}`]);
     newBuf = await gitBuffer(repoRoot, ["show", `:${filePath}`]);
+    extDiffArgs = ["diff", "--ext-diff", "--cached", "-M", "--", ...pathspecArgs];
   } else if (scope === "working") {
-    oldBuf = await gitBuffer(repoRoot, ["show", `:${filePath}`]) ?? (oldPath !== filePath ? await gitBuffer(repoRoot, ["show", `:${oldPath}`]) : null) ?? await gitBuffer(repoRoot, ["show", `HEAD:${oldPath}`]);
-    newBuf = await readWorkingTreeBuffer(repoRoot, path.join(repoRoot, filePath));
+    const trackedRes = await git(repoRoot, [
+      "ls-files",
+      "--error-unmatch",
+      "--",
+      `:(literal)${filePath}`
+    ]);
+    oldBuf = trackedRes.ok ? await gitBuffer(repoRoot, ["show", `:${filePath}`]) ?? (oldPath !== filePath ? await gitBuffer(repoRoot, ["show", `:${oldPath}`]) : null) : previousPath ? await gitBuffer(repoRoot, ["show", `:${oldPath}`]) ?? await gitBuffer(repoRoot, ["show", `HEAD:${oldPath}`]) : null;
+    newBuf = await readWorkingTreeBuffer(repoRoot, absPath);
+    if (trackedRes.ok) {
+      extDiffArgs = ["diff", "--ext-diff", "--", `:(literal)${filePath}`];
+    } else if (!oldBuf) {
+      extDiffArgs = ["diff", "--ext-diff", "--no-index", "--", "/dev/null", filePath];
+      extDiffAllowExit1 = true;
+    }
   } else if (scope === "branch") {
     if (!base || !head || !isSafeGitRef(base) || !isSafeGitRef(head)) {
       throw new Error("Valid base and head are required for branch scope");
@@ -715,17 +1181,141 @@ var readFileDiff = async (params) => {
     if (!mbRes.ok || !mbRes.stdout.trim())
       throw new Error("Could not resolve merge-base");
     const mergeBase = mbRes.stdout.trim();
+    const [baseEntry, headEntry, worktreeEntry] = await Promise.all([
+      readGitEntryInfo(repoRoot, ["ls-tree", "-z", mergeBase, "--", oldRepoPath], oldRepoPath),
+      includeWorkingTree ? readGitEntryInfo(repoRoot, ["ls-files", "--stage", "-z", "--", `:(literal)${repoPath}`], repoPath) : readGitEntryInfo(repoRoot, ["ls-tree", "-z", head, "--", repoPath], repoPath),
+      includeWorkingTree ? fs.lstat(absPath).catch(() => null) : Promise.resolve(null)
+    ]);
+    if (baseEntry?.mode === GITLINK_MODE || headEntry?.mode === GITLINK_MODE) {
+      const subState = includeWorkingTree ? await readSubmoduleState(repoRoot, repoPath, absPath) : {
+        headCommit: baseEntry?.mode === GITLINK_MODE ? baseEntry.hash || null : null,
+        indexCommit: headEntry?.mode === GITLINK_MODE ? headEntry.hash || null : null,
+        worktreeCommit: headEntry?.mode === GITLINK_MODE ? headEntry.hash || null : null,
+        hasTrackedChanges: false,
+        hasUntrackedFiles: false,
+        hasConflict: false
+      };
+      return {
+        path: filePath,
+        previousPath,
+        original: "",
+        modified: "",
+        isBinary: false,
+        isImage: false,
+        submodule: {
+          ...subState,
+          headCommit: baseEntry?.mode === GITLINK_MODE ? baseEntry.hash || null : subState.headCommit,
+          indexCommit: baseEntry?.mode === GITLINK_MODE ? baseEntry.hash || null : subState.indexCommit
+        },
+        difft: null
+      };
+    }
+    if (includeWorkingTree && !baseEntry && !headEntry && worktreeEntry?.isDirectory()) {
+      const hasDotGit = await fs.lstat(path.join(absPath, ".git")).then(() => true).catch(() => false);
+      return {
+        path: filePath,
+        previousPath,
+        original: "",
+        modified: "",
+        isBinary: false,
+        isImage: false,
+        unavailableReason: hasDotGit ? "nested_repository" : "untracked_directory",
+        difft: null
+      };
+    }
     oldBuf = await gitBuffer(repoRoot, ["show", `${mergeBase}:${oldPath}`]);
-    newBuf = await readWorkingTreeBuffer(repoRoot, path.join(repoRoot, filePath));
+    newBuf = includeWorkingTree ? await readWorkingTreeBuffer(repoRoot, absPath) : await gitBuffer(repoRoot, ["show", `${head}:${filePath}`]);
+    if (includeWorkingTree) {
+      if (headEntry || baseEntry && !worktreeEntry) {
+        extDiffArgs = ["diff", "--ext-diff", "-C", mergeBase, "--", ...pathspecArgs];
+      } else if (!baseEntry) {
+        extDiffArgs = ["diff", "--ext-diff", "--no-index", "--", "/dev/null", filePath];
+        extDiffAllowExit1 = true;
+      }
+    } else {
+      extDiffArgs = ["diff", "--ext-diff", "-C", `${base}...${head}`, "--", ...pathspecArgs];
+    }
   } else if (scope === "commit") {
     if (!hash || !SHA_RE.test(hash))
       throw new Error("Valid commit hash is required");
     const parentRes = await git(repoRoot, ["rev-parse", "--verify", "--quiet", `${hash}^`]);
     const parentSha = parentRes.ok ? parentRes.stdout.trim() : "";
+    const [parentEntry, commitEntry] = await Promise.all([
+      parentSha ? readGitEntryInfo(repoRoot, ["ls-tree", "-z", parentSha, "--", oldRepoPath], oldRepoPath) : Promise.resolve(null),
+      readGitEntryInfo(repoRoot, ["ls-tree", "-z", hash, "--", repoPath], repoPath)
+    ]);
+    if (parentEntry?.mode === GITLINK_MODE || commitEntry?.mode === GITLINK_MODE) {
+      return {
+        path: filePath,
+        previousPath,
+        original: "",
+        modified: "",
+        isBinary: false,
+        isImage: false,
+        submodule: {
+          headCommit: parentEntry?.mode === GITLINK_MODE ? parentEntry.hash || null : null,
+          indexCommit: parentEntry?.mode === GITLINK_MODE ? parentEntry.hash || null : null,
+          worktreeCommit: commitEntry?.mode === GITLINK_MODE ? commitEntry.hash || null : null,
+          hasTrackedChanges: false,
+          hasUntrackedFiles: false,
+          hasConflict: false
+        },
+        difft: null
+      };
+    }
     if (parentSha) {
       oldBuf = await gitBuffer(repoRoot, ["show", `${parentSha}:${oldPath}`]);
     }
     newBuf = await gitBuffer(repoRoot, ["show", `${hash}:${filePath}`]);
+    extDiffArgs = [
+      "show",
+      "--format=",
+      "--root",
+      "--diff-merges=first-parent",
+      "--find-renames",
+      "--ext-diff",
+      hash,
+      "--",
+      ...pathspecArgs
+    ];
+  } else if (scope === "pr") {
+    if (!base || !head || !isSafeGitRef(base) || !isSafeGitRef(head)) {
+      throw new Error("Valid base and head are required for PR scope");
+    }
+    const mbRes = await git(repoRoot, ["merge-base", base, head]);
+    const baseTreeRef = mbRes.ok && mbRes.stdout.trim() ? mbRes.stdout.trim() : base;
+    const [baseLocalRes, headLocalRes] = await Promise.all([
+      git(repoRoot, ["cat-file", "-e", `${baseTreeRef}^{commit}`]),
+      git(repoRoot, ["cat-file", "-e", `${head}^{commit}`])
+    ]);
+    if (baseLocalRes.ok && headLocalRes.ok) {
+      const [baseEntry, headEntry] = await Promise.all([
+        readGitEntryInfo(repoRoot, ["ls-tree", "-z", baseTreeRef, "--", oldRepoPath], oldRepoPath),
+        readGitEntryInfo(repoRoot, ["ls-tree", "-z", head, "--", repoPath], repoPath)
+      ]);
+      if (baseEntry?.mode === GITLINK_MODE || headEntry?.mode === GITLINK_MODE) {
+        return {
+          path: filePath,
+          previousPath,
+          original: "",
+          modified: "",
+          isBinary: false,
+          isImage: false,
+          submodule: {
+            headCommit: baseEntry?.mode === GITLINK_MODE ? baseEntry.hash || null : null,
+            indexCommit: baseEntry?.mode === GITLINK_MODE ? baseEntry.hash || null : null,
+            worktreeCommit: headEntry?.mode === GITLINK_MODE ? headEntry.hash || null : null,
+            hasTrackedChanges: false,
+            hasUntrackedFiles: false,
+            hasConflict: false
+          },
+          difft: null
+        };
+      }
+      extDiffArgs = ["diff", "--ext-diff", "-C", baseTreeRef, head, "--", ...pathspecArgs];
+    }
+    oldBuf = baseLocalRes.ok ? await gitBuffer(repoRoot, ["show", `${baseTreeRef}:${oldPath}`]) : await fetchGithubRawFileBuffer(repoRoot, oldPath, base);
+    newBuf = headLocalRes.ok ? await gitBuffer(repoRoot, ["show", `${head}:${filePath}`]) : await fetchGithubRawFileBuffer(repoRoot, filePath, head);
   } else {
     throw new Error(`Unknown diff scope: ${scope}`);
   }
@@ -758,7 +1348,37 @@ var readFileDiff = async (params) => {
 `);
   const modified = (newBuf ? newBuf.toString("utf8") : "").replace(/\r\n/g, `
 `);
-  const { difft, difftError } = await runDifftJson(filePath, original, modified, ignoreComments);
+  if (original === "" && modified !== "") {
+    return {
+      path: filePath,
+      previousPath,
+      original,
+      modified,
+      isBinary: false,
+      isImage: false,
+      difft: {
+        path: filePath,
+        language: path.extname(filePath).slice(1) || "Text",
+        status: "created"
+      }
+    };
+  }
+  if (original !== "" && modified === "") {
+    return {
+      path: filePath,
+      previousPath,
+      original,
+      modified,
+      isBinary: false,
+      isImage: false,
+      difft: {
+        path: filePath,
+        language: path.extname(filePath).slice(1) || "Text",
+        status: "deleted"
+      }
+    };
+  }
+  const { difft, difftError } = extDiffArgs ? await runGitExtDifft(repoRoot, filePath, extDiffArgs, ignoreComments, extDiffAllowExit1) : await runDifftTempFiles(filePath, original, modified, ignoreComments);
   return {
     path: filePath,
     previousPath,
@@ -785,7 +1405,8 @@ var server = http.createServer((req, res) => {
       sendJson(res, 200, {
         ok: true,
         difftAvailable: Boolean(info.bin),
-        difftVersion: info.version
+        difftVersion: info.version,
+        ghAvailable: Boolean(getGhBinary())
       });
     });
     return;
@@ -800,6 +1421,11 @@ var server = http.createServer((req, res) => {
     return;
   }
   const handle = async () => {
+    if (url.pathname === "/git-dirs") {
+      const data = await findGitDirectories(directory);
+      sendJson(res, 200, data);
+      return;
+    }
     if (url.pathname === "/status") {
       const data = await readStatus(directory);
       sendJson(res, 200, data);
@@ -830,6 +1456,17 @@ var server = http.createServer((req, res) => {
       sendJson(res, 200, data);
       return;
     }
+    if (url.pathname === "/prs") {
+      const data = await readPullRequests(directory);
+      sendJson(res, 200, data);
+      return;
+    }
+    if (url.pathname === "/pr-files") {
+      const number = Number.parseInt(url.searchParams.get("number") ?? "0", 10);
+      const data = await readPullRequestFiles(directory, number);
+      sendJson(res, 200, data);
+      return;
+    }
     if (url.pathname === "/file-diff") {
       const scope = url.searchParams.get("scope") ?? "working";
       const filePath = url.searchParams.get("path") ?? "";
@@ -837,6 +1474,7 @@ var server = http.createServer((req, res) => {
       const base = url.searchParams.get("base") || undefined;
       const head = url.searchParams.get("head") || undefined;
       const hash = url.searchParams.get("hash") || undefined;
+      const includeWorkingTree = url.searchParams.get("includeWorkingTree") !== "false";
       const ignoreComments = url.searchParams.get("ignoreComments") === "true";
       const data = await readFileDiff({
         directory,
@@ -846,6 +1484,7 @@ var server = http.createServer((req, res) => {
         base,
         head,
         hash,
+        includeWorkingTree,
         ignoreComments
       });
       sendJson(res, 200, data);

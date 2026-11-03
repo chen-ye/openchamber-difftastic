@@ -5,9 +5,13 @@ import { Icon } from './icons';
 import {
   ChangeScopeSelector,
   BranchComparisonSelector,
+  BranchTargetSelector,
   CommitComparisonSelector,
+  PullRequestComparisonSelector,
+  NestedRepoPicker,
   DiffViewToggle,
   ToolbarIconButton,
+  type BranchTargetValue,
 } from './Selectors';
 import {
   PierreDiffViewer,
@@ -28,6 +32,7 @@ import {
   isBranchScopeAvailable,
   resolveBranchComparisonBase,
 } from './baseBranch';
+import { chooseAutoNestedRepo, discoversNestedRepos } from './nestedRepositories';
 import { ensureHostPierreThemeRegistered } from './pierreTheme';
 import type {
   DiffData,
@@ -35,9 +40,14 @@ import type {
   DiffViewMode,
   FileEntry,
   GitCommitFile,
+  GitDirectoriesResponse,
   GitLogEntry,
+  GitPathUnavailableReason,
+  GitPullRequestEntry,
+  GitPullRequestFile,
   GitRangeFile,
   GitStatusResponse,
+  GitSubmoduleState,
   ServiceFileDiffResponse,
 } from './types';
 
@@ -63,6 +73,391 @@ const formatDiffTotals = (insertions?: number, deletions?: number) => {
       {added ? <span style={{ color: 'var(--status-success)' }}>+{added}</span> : null}
       {removed ? <span style={{ color: 'var(--status-error)' }}>-{removed}</span> : null}
     </span>
+  );
+};
+
+const toAbsolutePath = (directory: string, filePath: string): string => {
+  const cleanDir = directory.replace(/\/+$/, '');
+  const cleanRel = filePath.replace(/^\/+/, '').replace(/\/+$/, '');
+  return cleanRel ? `${cleanDir}/${cleanRel}` : cleanDir;
+};
+
+const SubmoduleDiffSummary: React.FC<{
+  state: GitSubmoduleState;
+  staged: boolean;
+  onOpenRepository?: () => void;
+}> = ({ state, staged, onOpenRepository }) => {
+  const shortCommit = (c: string) => c.slice(0, 7);
+  const from = staged ? state.headCommit : state.indexCommit;
+  const to = staged ? state.indexCommit : state.worktreeCommit;
+
+  let commitLine: string | null = null;
+  if (state.hasConflict) {
+    commitLine = 'Submodule has merge conflicts';
+  } else if (from && to) {
+    commitLine =
+      from === to
+        ? `Submodule commit ${shortCommit(to)} (unchanged)`
+        : `Submodule commit changed from ${shortCommit(from)} to ${shortCommit(to)}`;
+  } else if (to) {
+    commitLine = `Submodule added at commit ${shortCommit(to)}`;
+  } else if (from) {
+    commitLine = staged
+      ? `Submodule removed (was ${shortCommit(from)})`
+      : `Submodule not checked out (expected ${shortCommit(from)})`;
+  }
+
+  return (
+    <div className="oc-submodule-box">
+      <div className="oc-submodule-header">
+        <div>
+          <div className="oc-submodule-title">Git submodule</div>
+          {commitLine ? <div className="oc-submodule-meta">{commitLine}</div> : null}
+          {!staged && state.hasTrackedChanges ? (
+            <div className="oc-submodule-meta">Has modified tracked content inside submodule</div>
+          ) : null}
+          {!staged && state.hasUntrackedFiles ? (
+            <div className="oc-submodule-meta">Has untracked files inside submodule</div>
+          ) : null}
+        </div>
+        {onOpenRepository && state.worktreeCommit ? (
+          <button type="button" className="oc-submodule-open-btn" onClick={onOpenRepository}>
+            Switch to submodule
+          </button>
+        ) : null}
+      </div>
+    </div>
+  );
+};
+
+const toNestedFileEntries = (status: GitStatusResponse): FileEntry[] =>
+  status.files
+    .map((file) => {
+      const staged = status.diffStats?.staged?.[file.path];
+      const working = status.diffStats?.working?.[file.path];
+      return {
+        ...file,
+        insertions: (staged?.insertions ?? 0) + (working?.insertions ?? 0),
+        deletions: (staged?.deletions ?? 0) + (working?.deletions ?? 0),
+        isNew: isNewStatusFile(file),
+      };
+    })
+    .sort((a, b) => a.path.localeCompare(b.path));
+
+const NestedRepositoryFileDiff: React.FC<{
+  directory: string;
+  file: FileEntry;
+  revision: number;
+  renderSideBySide: boolean;
+  wrapLines: boolean;
+  ignoreComments: boolean;
+  themeId: string;
+  isDark: boolean;
+  serviceGet: <T>(path: string, query: Record<string, string>) => Promise<T>;
+}> = ({
+  directory,
+  file,
+  revision,
+  renderSideBySide,
+  wrapLines,
+  ignoreComments,
+  themeId,
+  isDark,
+  serviceGet,
+}) => {
+  const [response, setResponse] = useState<ServiceFileDiffResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [fullContext, setFullContext] = useState(false);
+  const [forceLineDiff, setForceLineDiff] = useState(false);
+
+  const staged = isStagedStatusFile(file) && !isWorkingStatusFile(file);
+  const scope: DiffScope = staged ? 'staged' : 'working';
+  const isRenamedInScope =
+    scope === 'staged'
+      ? file.index === 'R' || file.index === 'C'
+      : file.working_dir === 'R' || file.working_dir === 'C';
+  const effectivePreviousPath = isRenamedInScope ? file.previousPath : undefined;
+  const fileStatusKey = `${file.index}:${file.working_dir}:${file.insertions}:${file.deletions}`;
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    const query: Record<string, string> = {
+      directory,
+      scope,
+      path: file.path,
+      ignoreComments: ignoreComments ? 'true' : 'false',
+    };
+    if (effectivePreviousPath) query.previousPath = effectivePreviousPath;
+
+    serviceGet<ServiceFileDiffResponse>('/file-diff', query)
+      .then((res) => {
+        if (cancelled) return;
+        setResponse(res);
+        setLoading(false);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setError(err instanceof Error ? err.message : String(err));
+        setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [directory, effectivePreviousPath, file.path, fileStatusKey, ignoreComments, revision, scope, serviceGet]);
+
+  const adapted = useMemo(() => {
+    if (
+      !response ||
+      response.unavailableReason ||
+      response.submodule ||
+      response.isBinary ||
+      response.isImage
+    ) {
+      return null;
+    }
+    return adaptDifftToViewModel({
+      filePath: file.path,
+      previousPath: effectivePreviousPath,
+      original: response.original,
+      modified: response.modified,
+      difft: response.difft,
+      contextLines: 3,
+      fullContext,
+    });
+  }, [effectivePreviousPath, file.path, fullContext, response]);
+
+  if (loading && !response) {
+    return (
+      <div className="oc-diff-entry-status">
+        <Icon name="loader-4" className="oc-icon oc-spin" />
+        <span>Loading nested diff…</span>
+      </div>
+    );
+  }
+  if (error) {
+    return <div className="oc-diff-entry-status">{error}</div>;
+  }
+  if (!response) return null;
+  if (response.unavailableReason) {
+    return (
+      <div className="oc-diff-entry-status">
+        {response.unavailableReason === 'nested_repository'
+          ? 'Separate Git repository'
+          : response.unavailableReason === 'untracked_directory'
+            ? 'Directory of untracked files'
+            : 'File no longer available'}
+      </div>
+    );
+  }
+  if (response.submodule) {
+    return <SubmoduleDiffSummary state={response.submodule} staged={staged} />;
+  }
+  if (response.isImage) {
+    return (
+      <InlineImageDiffViewer
+        filePath={file.path}
+        diff={{
+          original: response.original,
+          modified: response.modified,
+          isImage: true,
+          contextMode: 'full',
+        }}
+        renderSideBySide={renderSideBySide}
+      />
+    );
+  }
+  if (response.isBinary) {
+    return <div className="oc-diff-entry-status">Binary file changed</div>;
+  }
+  if (!adapted) return null;
+
+  const activeFileDiff = forceLineDiff ? adapted.fallbackFileDiff : adapted.fileDiff;
+  if (!forceLineDiff && activeFileDiff.hunks.length === 0) {
+    return (
+      <div className="oc-diff-entry-status oc-diff-entry-status--col">
+        <div className="oc-diff-entry-status-desc">
+          No structural syntax changes detected by Difftastic.
+        </div>
+        {adapted.fallbackFileDiff.hunks.length > 0 ? (
+          <button type="button" className="oc-link-btn" onClick={() => setForceLineDiff(true)}>
+            Show line diff anyway
+          </button>
+        ) : null}
+      </div>
+    );
+  }
+
+  return (
+    <PierreDiffViewer
+      fileDiff={activeFileDiff}
+      difftDecorations={forceLineDiff ? undefined : adapted.difftDecorations}
+      themeId={themeId}
+      isDark={isDark}
+      renderSideBySide={renderSideBySide}
+      wrapLines={wrapLines}
+      onExpandContextRequest={!fullContext && !forceLineDiff ? () => setFullContext(true) : undefined}
+    />
+  );
+};
+
+const NestedRepositoryChanges: React.FC<{
+  directory: string;
+  revision: number;
+  renderSideBySide: boolean;
+  wrapLines: boolean;
+  ignoreComments: boolean;
+  themeId: string;
+  isDark: boolean;
+  serviceGet: <T>(path: string, query: Record<string, string>) => Promise<T>;
+  onSwitchToRepository?: () => void;
+  hideHeader?: boolean;
+}> = ({
+  directory,
+  revision,
+  renderSideBySide,
+  wrapLines,
+  ignoreComments,
+  themeId,
+  isDark,
+  serviceGet,
+  onSwitchToRepository,
+  hideHeader = false,
+}) => {
+  const [status, setStatus] = useState<
+    | { kind: 'loading' }
+    | { kind: 'ready'; files: FileEntry[] }
+    | { kind: 'error'; message: string }
+  >({ kind: 'loading' });
+  const [retryNonce, setRetryNonce] = useState(0);
+  const [expandedFiles, setExpandedFiles] = useState<ReadonlySet<string>>(() => new Set());
+
+  useEffect(() => {
+    let cancelled = false;
+    serviceGet<GitStatusResponse>('/status', { directory })
+      .then((next) => {
+        if (cancelled) return;
+        setStatus({ kind: 'ready', files: toNestedFileEntries(next) });
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setStatus({
+          kind: 'error',
+          message: err instanceof Error ? err.message : String(err),
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [directory, revision, retryNonce, serviceGet]);
+
+  const toggleFile = useCallback((filePath: string) => {
+    setExpandedFiles((prev) => {
+      const next = new Set(prev);
+      if (!next.delete(filePath)) next.add(filePath);
+      return next;
+    });
+  }, []);
+
+  return (
+    <div className="oc-nested-repo-box">
+      {!hideHeader ? (
+        <div className="oc-nested-repo-header">
+          <div className="oc-nested-repo-header-text">
+            <div className="oc-nested-repo-title">Separate Git repository</div>
+            <div className="oc-nested-repo-desc">
+              This directory is its own Git repository. Its uncommitted changes are shown below.
+            </div>
+          </div>
+          {onSwitchToRepository ? (
+            <button
+              type="button"
+              className="oc-submodule-open-btn"
+              onClick={onSwitchToRepository}
+            >
+              Switch to repository
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+      {status.kind === 'loading' ? (
+        <div className="oc-diff-entry-status">
+          <Icon name="loader-4" className="oc-icon oc-spin" />
+          <span>Loading nested repository changes…</span>
+        </div>
+      ) : null}
+      {status.kind === 'error' ? (
+        <div className="oc-diff-entry-status oc-diff-entry-status--col">
+          <div className="oc-diff-entry-status-title">Failed to read nested repository</div>
+          <div className="oc-diff-entry-status-desc">{status.message}</div>
+          <button
+            type="button"
+            className="oc-link-btn"
+            onClick={() => setRetryNonce((n) => n + 1)}
+          >
+            Retry
+          </button>
+        </div>
+      ) : null}
+      {status.kind === 'ready' && status.files.length === 0 ? (
+        <div className="oc-nested-repo-empty">No uncommitted changes inside this repository.</div>
+      ) : null}
+      {status.kind === 'ready' && status.files.length > 0 ? (
+        <ul className="oc-nested-repo-list">
+          {status.files.map((nestedFile) => {
+            const isOpen = expandedFiles.has(nestedFile.path);
+            const descriptor = describeChange(nestedFile);
+            return (
+              <li key={nestedFile.path} className="oc-nested-repo-item">
+                <button
+                  type="button"
+                  aria-expanded={isOpen}
+                  onClick={() => toggleFile(nestedFile.path)}
+                  className="oc-nested-repo-file-btn"
+                  title={nestedFile.path}
+                >
+                  <Icon
+                    name={isOpen ? 'arrow-down-s' : 'arrow-right-s'}
+                    className="oc-icon-sm oc-muted-icon"
+                  />
+                  <span
+                    className="oc-status-letter"
+                    style={{ color: descriptor.color }}
+                    title={descriptor.label}
+                  >
+                    {descriptor.code}
+                  </span>
+                  <Icon name="file-code" className="oc-icon-sm oc-shrink-0" />
+                  <span
+                    className="oc-file-row-path"
+                    style={{ direction: 'rtl', unicodeBidi: 'plaintext' }}
+                  >
+                    {nestedFile.path}
+                  </span>
+                  {formatDiffTotals(nestedFile.insertions, nestedFile.deletions)}
+                </button>
+                {isOpen ? (
+                  <NestedRepositoryFileDiff
+                    directory={directory}
+                    file={nestedFile}
+                    revision={revision}
+                    renderSideBySide={renderSideBySide}
+                    wrapLines={wrapLines}
+                    ignoreComments={ignoreComments}
+                    themeId={themeId}
+                    isDark={isDark}
+                    serviceGet={serviceGet}
+                  />
+                ) : null}
+              </li>
+            );
+          })}
+        </ul>
+      ) : null}
+    </div>
   );
 };
 
@@ -236,19 +631,24 @@ const InlineImageDiffViewer: React.FC<{
 
 interface MultiFileDiffEntryProps {
   visible: boolean;
+  directory: string;
   file: FileEntry;
   scope: DiffScope;
   layout: 'inline' | 'side-by-side';
   wrapLines: boolean;
+  ignoreComments: boolean;
   themeId: string;
   isDark: boolean;
   isExpanded: boolean;
   isMounted: boolean;
+  revision: number;
   onExpandedChange: (path: string, expanded: boolean) => void;
   onLayoutChange: (path: string, layout: 'inline' | 'side-by-side') => void;
   registerSectionRef: (path: string, node: HTMLDivElement | null) => void;
   registerViewerRef: (path: string, handle: PierreDiffViewerHandle | null) => void;
   fetchFileDiff: (file: FileEntry) => Promise<ServiceFileDiffResponse>;
+  serviceGet: <T>(path: string, query: Record<string, string>) => Promise<T>;
+  onSelectRepository?: (repoPath: string) => void;
   requestKeyPrefix: string;
   onDiffLoaded?: (path: string, fileDiff: FileDiffMetadata | null) => void;
 }
@@ -256,19 +656,24 @@ interface MultiFileDiffEntryProps {
 const MultiFileDiffEntry = React.memo<MultiFileDiffEntryProps>(
   ({
     visible,
+    directory,
     file,
     scope,
     layout,
     wrapLines,
+    ignoreComments,
     themeId,
     isDark,
     isExpanded,
     isMounted,
+    revision,
     onExpandedChange,
     onLayoutChange,
     registerSectionRef,
     registerViewerRef,
     fetchFileDiff,
+    serviceGet,
+    onSelectRepository,
     requestKeyPrefix,
     onDiffLoaded,
   }) => {
@@ -285,6 +690,8 @@ const MultiFileDiffEntry = React.memo<MultiFileDiffEntryProps>(
 
     const requestKey = `${requestKeyPrefix}::${file.path}::${file.previousPath ?? ''}::${file.index}:${file.working_dir}:${file.insertions}:${file.deletions}:${file.revision ?? ''}::${retryNonce}`;
     const currentResponse = rawResponse?.key === requestKey ? rawResponse.response : null;
+    const unavailableReason: GitPathUnavailableReason | undefined =
+      currentResponse?.unavailableReason;
 
     useEffect(() => {
       setFullContext(false);
@@ -317,7 +724,15 @@ const MultiFileDiffEntry = React.memo<MultiFileDiffEntryProps>(
     }, [currentResponse, fetchFileDiff, file, isExpanded, isMounted, requestKey, visible]);
 
     const diffData = useMemo<DiffData | null>(() => {
-      if (!currentResponse || error) return null;
+      if (!currentResponse || error || currentResponse.unavailableReason) return null;
+      if (currentResponse.submodule) {
+        return {
+          original: '',
+          modified: '',
+          submodule: currentResponse.submodule,
+          contextMode: 'full',
+        };
+      }
       if (currentResponse.isBinary || currentResponse.isImage) {
         return {
           original: currentResponse.original,
@@ -350,7 +765,7 @@ const MultiFileDiffEntry = React.memo<MultiFileDiffEntryProps>(
     }, [currentResponse, error, file.path, file.previousPath, fullContext]);
 
     const activeFileDiff = useMemo<FileDiffMetadata | null>(() => {
-      if (!diffData || !isExpanded || !isMounted) return null;
+      if (!diffData || !isExpanded || !isMounted || diffData.submodule) return null;
       if (forceLineDiff && diffData.fallbackFileDiff) return diffData.fallbackFileDiff;
       return diffData.fileDiff ?? null;
     }, [diffData, forceLineDiff, isExpanded, isMounted]);
@@ -385,10 +800,12 @@ const MultiFileDiffEntry = React.memo<MultiFileDiffEntryProps>(
     const languageLabel = diffData?.difftDecorations?.language;
     const isStructurallyUnchanged =
       diffData &&
+      !diffData.submodule &&
       !diffData.isBinary &&
       !diffData.isImage &&
       !forceLineDiff &&
       (diffData.fileDiff?.hunks.length ?? 0) === 0;
+    const nestedAbsPath = toAbsolutePath(directory, file.path);
 
     return (
       <div ref={setSectionNode} className="oc-diff-entry">
@@ -462,10 +879,39 @@ const MultiFileDiffEntry = React.memo<MultiFileDiffEntryProps>(
         {isExpanded ? (
           <div className="oc-diff-entry-body">
             {!isMounted && !error ? <div className="oc-diff-entry-placeholder" /> : null}
-            {isMounted && loading && !diffData && !error ? (
+            {isMounted && loading && !diffData && !unavailableReason && !error ? (
               <div className="oc-diff-entry-status">
                 <Icon name="loader-4" className="oc-icon oc-spin" />
                 <span>Loading structural diff…</span>
+              </div>
+            ) : null}
+            {isMounted && unavailableReason === 'nested_repository' ? (
+              <NestedRepositoryChanges
+                directory={nestedAbsPath}
+                revision={revision}
+                renderSideBySide={renderSideBySide}
+                wrapLines={wrapLines}
+                ignoreComments={ignoreComments}
+                themeId={themeId}
+                isDark={isDark}
+                serviceGet={serviceGet}
+                onSwitchToRepository={
+                  onSelectRepository ? () => onSelectRepository(nestedAbsPath) : undefined
+                }
+              />
+            ) : null}
+            {isMounted && unavailableReason && unavailableReason !== 'nested_repository' ? (
+              <div className="oc-diff-entry-status oc-diff-entry-status--col">
+                <div className="oc-diff-entry-status-title">
+                  {unavailableReason === 'untracked_directory'
+                    ? 'Directory of untracked files'
+                    : 'File no longer available'}
+                </div>
+                <div className="oc-diff-entry-status-desc">
+                  {unavailableReason === 'untracked_directory'
+                    ? 'This path is an unexpanded directory of untracked files.'
+                    : 'This path is missing from the working tree and index.'}
+                </div>
               </div>
             ) : null}
             {error ? (
@@ -481,8 +927,35 @@ const MultiFileDiffEntry = React.memo<MultiFileDiffEntryProps>(
                 </button>
               </div>
             ) : null}
+            {isMounted && diffData?.submodule ? (
+              <div>
+                <SubmoduleDiffSummary
+                  state={diffData.submodule}
+                  staged={scope === 'staged'}
+                  onOpenRepository={
+                    onSelectRepository ? () => onSelectRepository(nestedAbsPath) : undefined
+                  }
+                />
+                {scope !== 'staged' &&
+                diffData.submodule.worktreeCommit &&
+                (diffData.submodule.hasTrackedChanges || diffData.submodule.hasUntrackedFiles) ? (
+                  <NestedRepositoryChanges
+                    directory={nestedAbsPath}
+                    revision={revision}
+                    renderSideBySide={renderSideBySide}
+                    wrapLines={wrapLines}
+                    ignoreComments={ignoreComments}
+                    themeId={themeId}
+                    isDark={isDark}
+                    serviceGet={serviceGet}
+                    hideHeader
+                  />
+                ) : null}
+              </div>
+            ) : null}
             {isMounted &&
             diffData &&
+            !diffData.submodule &&
             !forceRenderLarge &&
             file.insertions + file.deletions > LARGE_DIFF_CHANGED_LINES ? (
               <div className="oc-diff-entry-status oc-diff-entry-status--col">
@@ -500,6 +973,7 @@ const MultiFileDiffEntry = React.memo<MultiFileDiffEntryProps>(
             ) : null}
             {isMounted &&
             diffData &&
+            !diffData.submodule &&
             (forceRenderLarge || file.insertions + file.deletions <= LARGE_DIFF_CHANGED_LINES) ? (
               diffData.isImage ? (
                 <InlineImageDiffViewer
@@ -613,9 +1087,29 @@ export interface DiffViewProps {
 export const DiffView: React.FC<DiffViewProps> = ({
   host,
   ready,
-  directory,
+  directory: rootDirectory,
   lifecycleTick,
 }) => {
+  // Nested repository discovery & selection (mirroring useNestedGitDirectory)
+  const [rootStatusState, setRootStatusState] = useState<{
+    directory: string;
+    data: GitStatusResponse;
+  } | null>(null);
+  const [rootNestedReposState, setRootNestedReposState] = useState<{
+    directory: string;
+    repos: string[];
+  } | null>(null);
+  const [selectedNestedByRoot, setSelectedNestedByRoot] = useState<
+    Record<string, { path: string; auto: boolean }>
+  >({});
+  const [staleClearedByRoot, setStaleClearedByRoot] = useState<
+    Record<string, ReadonlySet<string>>
+  >({});
+  const [currentNestedReposState, setCurrentNestedReposState] = useState<{
+    directory: string;
+    repos: string[];
+  } | null>(null);
+
   const [statusState, setStatusState] = useState<{
     directory: string;
     data: GitStatusResponse;
@@ -627,6 +1121,7 @@ export const DiffView: React.FC<DiffViewProps> = ({
   const [activeScope, setActiveScope] = useState<DiffScope>('branch');
   const [userPickedScope, setUserPickedScope] = useState(false);
   const [baseOverrides, setBaseOverrides] = useState<Record<string, string>>({});
+  const [branchTargets, setBranchTargets] = useState<Record<string, BranchTargetValue>>({});
 
   const [branchFilesState, setBranchFilesState] = useState<{
     key: string;
@@ -635,7 +1130,10 @@ export const DiffView: React.FC<DiffViewProps> = ({
   const [branchFilesLoading, setBranchFilesLoading] = useState(false);
   const [branchFilesError, setBranchFilesError] = useState<string | null>(null);
 
-  const [commits, setCommits] = useState<GitLogEntry[]>([]);
+  const [commitsState, setCommitsState] = useState<{
+    directory: string;
+    commits: GitLogEntry[];
+  } | null>(null);
   const [commitsLoading, setCommitsLoading] = useState(false);
   const [commitsError, setCommitsError] = useState<string | null>(null);
   const [selectedCommitHash, setSelectedCommitHash] = useState<string | null>(null);
@@ -645,6 +1143,26 @@ export const DiffView: React.FC<DiffViewProps> = ({
   } | null>(null);
   const [commitFilesLoading, setCommitFilesLoading] = useState(false);
   const [commitFilesError, setCommitFilesError] = useState<string | null>(null);
+
+  // Pull requests comparison state
+  const [prsState, setPrsState] = useState<{
+    directory: string;
+    prs: GitPullRequestEntry[];
+    available: boolean;
+  } | null>(null);
+  const [prsLoading, setPrsLoading] = useState(false);
+  const [prsError, setPrsError] = useState<string | null>(null);
+  const [selectedPrNumber, setSelectedPrNumber] = useState<number | null>(null);
+  const commitsRequestSeqRef = useRef(0);
+  const prsRequestSeqRef = useRef(0);
+  const [prFilesState, setPrFilesState] = useState<{
+    key: string;
+    files: GitPullRequestFile[];
+    baseRefOid: string;
+    headRefOid: string;
+  } | null>(null);
+  const [prFilesLoading, setPrFilesLoading] = useState(false);
+  const [prFilesError, setPrFilesError] = useState<string | null>(null);
 
   const [fileListMode, setFileListMode] = useState<'flat' | 'tree'>('flat');
   const [wrapLines, setWrapLines] = useState(false);
@@ -676,14 +1194,6 @@ export const DiffView: React.FC<DiffViewProps> = ({
   const themeId = useMemo(() => ensureHostPierreThemeRegistered(ready.theme), [ready.theme]);
   const isDark = ready.theme.mode === 'dark';
 
-  const status = statusState?.directory === directory ? statusState.data : null;
-
-  useEffect(() => {
-    const onResize = () => setViewportWidth(window.innerWidth);
-    window.addEventListener('resize', onResize);
-    return () => window.removeEventListener('resize', onResize);
-  }, []);
-
   const serviceGet = useCallback(
     async <T,>(path: string, query: Record<string, string>): Promise<T> => {
       const response = await host.serviceRequest({
@@ -700,21 +1210,180 @@ export const DiffView: React.FC<DiffViewProps> = ({
     [host],
   );
 
-  // Load repository status + branches
+  // 1. Probe rootDirectory and discover nested repositories under rootDirectory
   useEffect(() => {
-    if (!directory) {
+    if (!rootDirectory) {
+      setRootStatusState(null);
+      setRootNestedReposState(null);
+      return;
+    }
+    let cancelled = false;
+
+    serviceGet<GitStatusResponse>('/status', { directory: rootDirectory })
+      .then((res) => {
+        if (cancelled) return;
+        setRootStatusState({ directory: rootDirectory, data: res });
+        if (discoversNestedRepos(rootDirectory, res.homeDirectory)) {
+          return serviceGet<GitDirectoriesResponse>('/git-dirs', { directory: rootDirectory });
+        }
+        return null;
+      })
+      .then((dirsRes) => {
+        if (cancelled || !dirsRes) return;
+        setRootNestedReposState({
+          directory: rootDirectory,
+          repos: dirsRes.repositories.map((r) => r.path),
+        });
+      })
+      .catch(() => {
+        // handled by effectiveDirectory status load below
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [lifecycleTick, refreshTick, rootDirectory, serviceGet]);
+
+  const rootStatus = rootStatusState?.directory === rootDirectory ? rootStatusState.data : null;
+  const rootIsGitRepo = rootStatus ? rootStatus.isGitRepo : null;
+  const rootNestedRepos =
+    rootNestedReposState?.directory === rootDirectory ? rootNestedReposState.repos : null;
+  const rootSelection = rootDirectory ? selectedNestedByRoot[rootDirectory] ?? null : null;
+  const staleClearedSelections = rootDirectory ? staleClearedByRoot[rootDirectory] ?? null : null;
+
+  // Auto-select first non-hidden nested repo when rootDirectory is not a git repo
+  useEffect(() => {
+    if (!rootDirectory || rootIsGitRepo !== false) return;
+    if (!rootNestedRepos || rootNestedRepos.length === 0) return;
+    if (rootSelection) return;
+    const candidates = staleClearedSelections
+      ? rootNestedRepos.filter((repo) => !staleClearedSelections.has(repo))
+      : rootNestedRepos;
+    const autoPicked = chooseAutoNestedRepo(rootDirectory, candidates);
+    if (!autoPicked) return;
+    setSelectedNestedByRoot((prev) => ({
+      ...prev,
+      [rootDirectory]: { path: autoPicked, auto: true },
+    }));
+  }, [rootDirectory, rootIsGitRepo, rootNestedRepos, rootSelection, staleClearedSelections]);
+
+  // Clear auto-selection if root itself becomes a git repo with commits
+  useEffect(() => {
+    if (!rootDirectory || !rootSelection?.auto) return;
+    if (rootIsGitRepo !== true || rootStatus?.unborn) return;
+    setSelectedNestedByRoot((prev) => {
+      const next = { ...prev };
+      delete next[rootDirectory];
+      return next;
+    });
+  }, [rootDirectory, rootIsGitRepo, rootSelection, rootStatus?.unborn]);
+
+  const effectiveDirectory = rootSelection?.path ?? rootDirectory;
+  const status = statusState?.directory === effectiveDirectory ? statusState.data : null;
+  const selectedIsGitRepo =
+    effectiveDirectory && effectiveDirectory !== rootDirectory
+      ? status?.isGitRepo ?? null
+      : null;
+
+  // Discover second-level nested repos when operating inside a selected nested repo
+  useEffect(() => {
+    if (!effectiveDirectory || effectiveDirectory === rootDirectory) {
+      setCurrentNestedReposState(null);
+      return;
+    }
+    if (selectedIsGitRepo === null) return;
+    if (!discoversNestedRepos(effectiveDirectory, rootStatus?.homeDirectory)) return;
+    let cancelled = false;
+    serviceGet<GitDirectoriesResponse>('/git-dirs', { directory: effectiveDirectory })
+      .then((res) => {
+        if (cancelled) return;
+        setCurrentNestedReposState({
+          directory: effectiveDirectory,
+          repos: res.repositories.map((r) => r.path),
+        });
+      })
+      .catch(() => {
+        // ignore
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    effectiveDirectory,
+    lifecycleTick,
+    refreshTick,
+    rootDirectory,
+    rootStatus?.homeDirectory,
+    selectedIsGitRepo,
+    serviceGet,
+  ]);
+
+  const currentNestedRepos =
+    currentNestedReposState?.directory === effectiveDirectory
+      ? currentNestedReposState.repos
+      : null;
+
+  const repositoryOptions = useMemo<string[] | null>(() => {
+    if (!rootDirectory) return null;
+    const discovered = rootNestedRepos && rootNestedRepos.length > 0 ? rootNestedRepos : null;
+    const currentDiscovered =
+      currentNestedRepos && currentNestedRepos.length > 0 ? currentNestedRepos : null;
+    const selectedRepo =
+      effectiveDirectory && effectiveDirectory !== rootDirectory ? effectiveDirectory : null;
+
+    if (selectedRepo) {
+      const options = [
+        ...(rootIsGitRepo === true ? [rootDirectory] : []),
+        ...(discovered ?? []),
+        selectedRepo,
+        ...(currentDiscovered ?? []),
+      ];
+      return [...new Set(options)];
+    }
+    if (discovered) {
+      return rootIsGitRepo === true ? [rootDirectory, ...discovered] : discovered;
+    }
+    return null;
+  }, [currentNestedRepos, effectiveDirectory, rootDirectory, rootIsGitRepo, rootNestedRepos]);
+
+  const handleSelectRepository = useCallback(
+    (repoPath: string) => {
+      if (!rootDirectory) return;
+      setSelectedNestedByRoot((prev) => {
+        const next = { ...prev };
+        if (repoPath === rootDirectory) {
+          delete next[rootDirectory];
+        } else {
+          next[rootDirectory] = { path: repoPath, auto: false };
+        }
+        return next;
+      });
+    },
+    [rootDirectory],
+  );
+
+  // Load status for effectiveDirectory
+  useEffect(() => {
+    if (!effectiveDirectory) {
       setStatusState(null);
       setStatusError(null);
       return;
     }
+    if (effectiveDirectory === rootDirectory && rootStatus) {
+      setStatusState({ directory: effectiveDirectory, data: rootStatus });
+      setLoadingStatus(false);
+      setStatusError(null);
+      return;
+    }
+
     let cancelled = false;
     setLoadingStatus(true);
     setStatusError(null);
 
-    serviceGet<GitStatusResponse>('/status', { directory })
+    serviceGet<GitStatusResponse>('/status', { directory: effectiveDirectory })
       .then((next) => {
         if (cancelled) return;
-        setStatusState({ directory, data: next });
+        setStatusState({ directory: effectiveDirectory, data: next });
         setLoadingStatus(false);
       })
       .catch((err) => {
@@ -726,11 +1395,88 @@ export const DiffView: React.FC<DiffViewProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [directory, lifecycleTick, refreshTick, serviceGet]);
+  }, [effectiveDirectory, lifecycleTick, refreshTick, rootDirectory, rootStatus, serviceGet]);
+
+  // Drop stale nested repository selection if that directory is no longer a git repository
+  useEffect(() => {
+    if (!rootDirectory || !effectiveDirectory || effectiveDirectory === rootDirectory) return;
+    if (selectedIsGitRepo !== false) return;
+    setStaleClearedByRoot((prev) => {
+      const nextSet = new Set(prev[rootDirectory]);
+      nextSet.add(effectiveDirectory);
+      return { ...prev, [rootDirectory]: nextSet };
+    });
+    setSelectedNestedByRoot((prev) => {
+      const next = { ...prev };
+      delete next[rootDirectory];
+      return next;
+    });
+    setRefreshTick((t) => t + 1);
+  }, [effectiveDirectory, rootDirectory, selectedIsGitRepo]);
+
+  useEffect(() => {
+    const onResize = () => setViewportWidth(window.innerWidth);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
 
   const currentBranch = status?.current ?? null;
-  const baseOverrideKey = directory && currentBranch ? `${directory}::${currentBranch}` : null;
+  const baseOverrideKey =
+    effectiveDirectory && currentBranch ? `${effectiveDirectory}::${currentBranch}` : null;
   const chosenBase = baseOverrideKey ? baseOverrides[baseOverrideKey] ?? null : null;
+  const currentBranchTarget: BranchTargetValue =
+    (baseOverrideKey ? branchTargets[baseOverrideKey] : undefined) ?? { kind: 'working-tree' };
+
+  // Fetch PRs for open-PR base detection and for PR scope
+  const loadPullRequests = useCallback(() => {
+    if (!effectiveDirectory || status?.isGitRepo === false) return;
+    const targetDir = effectiveDirectory;
+    const reqId = ++prsRequestSeqRef.current;
+    setPrsLoading(true);
+    setPrsError(null);
+    serviceGet<{ available: boolean; prs: GitPullRequestEntry[]; error?: string }>('/prs', {
+      directory: targetDir,
+    })
+      .then((res) => {
+        if (prsRequestSeqRef.current !== reqId) return;
+        setPrsState({
+          directory: targetDir,
+          prs: res.prs,
+          available: res.available,
+        });
+        if (res.error && res.prs.length === 0) {
+          setPrsError(res.error);
+        }
+        setPrsLoading(false);
+        setSelectedPrNumber((prev) => {
+          if (prev && res.prs.some((p) => p.number === prev)) return prev;
+          const matchingBranchPr = currentBranch
+            ? res.prs.find((p) => p.headRefName === currentBranch && p.state === 'open')
+            : undefined;
+          const firstOpen = res.prs.find((p) => p.state === 'open');
+          return (matchingBranchPr ?? firstOpen ?? res.prs[0])?.number ?? null;
+        });
+      })
+      .catch((err) => {
+        if (prsRequestSeqRef.current !== reqId) return;
+        setPrsError(err instanceof Error ? err.message : String(err));
+        setPrsLoading(false);
+      });
+  }, [currentBranch, effectiveDirectory, serviceGet, status?.isGitRepo]);
+
+  useEffect(() => {
+    if (!effectiveDirectory || !status?.isGitRepo) return;
+    loadPullRequests();
+  }, [effectiveDirectory, lifecycleTick, loadPullRequests, refreshTick, status?.isGitRepo]);
+
+  const prs = prsState?.directory === effectiveDirectory ? prsState.prs : [];
+  const openPrForCurrentBranch = useMemo(
+    () =>
+      currentBranch
+        ? prs.find((pr) => pr.headRefName === currentBranch && pr.state === 'open') ?? null
+        : null,
+    [currentBranch, prs],
+  );
 
   const branchBaseResolution = useMemo(() => {
     if (!status || !currentBranch || currentBranch === 'HEAD') return null;
@@ -739,6 +1485,7 @@ export const DiffView: React.FC<DiffViewProps> = ({
     return resolveBranchComparisonBase(
       {
         chosen: chosenBase,
+        pullRequest: openPrForCurrentBranch?.baseRefName ?? null,
         createdFrom: status.createdFromBase,
         defaultBranch: primaryRemote ? status.branches.defaultBranches[primaryRemote] ?? null : null,
       },
@@ -752,7 +1499,7 @@ export const DiffView: React.FC<DiffViewProps> = ({
         headBranch: currentBranch,
       },
     );
-  }, [chosenBase, currentBranch, status]);
+  }, [chosenBase, currentBranch, openPrForCurrentBranch?.baseRefName, status]);
 
   const qualifiedBranchBase = branchBaseResolution?.ref ?? null;
   const showBranchOption = isBranchScopeAvailable(currentBranch, qualifiedBranchBase);
@@ -769,16 +1516,24 @@ export const DiffView: React.FC<DiffViewProps> = ({
     }
   }, [activeScope, showBranchOption, status, userPickedScope]);
 
+  const branchHeadRef =
+    currentBranchTarget.kind === 'ref'
+      ? currentBranchTarget.ref
+      : currentBranch ?? 'HEAD';
+  const branchIncludeWorkingTree = currentBranchTarget.kind === 'working-tree';
+
   const branchRangeKey =
-    directory && qualifiedBranchBase && currentBranch && showBranchOption
-      ? `${directory}::${qualifiedBranchBase}::${currentBranch}`
+    effectiveDirectory && qualifiedBranchBase && branchHeadRef && showBranchOption
+      ? `${effectiveDirectory}::${qualifiedBranchBase}::${branchHeadRef}::${
+          branchIncludeWorkingTree ? 'wt' : 'committed'
+        }`
       : null;
   const branchFiles =
     branchRangeKey && branchFilesState?.key === branchRangeKey ? branchFilesState.files : null;
 
   // Fetch branch comparison files
   useEffect(() => {
-    if (!directory || !qualifiedBranchBase || !currentBranch || !branchRangeKey) {
+    if (!effectiveDirectory || !qualifiedBranchBase || !branchHeadRef || !branchRangeKey) {
       setBranchFilesError(null);
       return;
     }
@@ -787,10 +1542,10 @@ export const DiffView: React.FC<DiffViewProps> = ({
     setBranchFilesError(null);
 
     serviceGet<{ files: GitRangeFile[] }>('/range-files', {
-      directory,
+      directory: effectiveDirectory,
       base: qualifiedBranchBase,
-      head: currentBranch,
-      includeWorkingTree: 'true',
+      head: branchHeadRef,
+      includeWorkingTree: branchIncludeWorkingTree ? 'true' : 'false',
     })
       .then((res) => {
         if (cancelled) return;
@@ -807,24 +1562,35 @@ export const DiffView: React.FC<DiffViewProps> = ({
       cancelled = true;
     };
   }, [
+    branchHeadRef,
+    branchIncludeWorkingTree,
     branchRangeKey,
-    currentBranch,
-    directory,
+    effectiveDirectory,
     lifecycleTick,
     qualifiedBranchBase,
     refreshTick,
     serviceGet,
   ]);
 
+  const commits =
+    commitsState?.directory === effectiveDirectory ? commitsState.commits : [];
+
   // Fetch commit log when in commit scope
   const loadCommits = useCallback(() => {
-    if (!directory) return;
+    if (!effectiveDirectory) return;
+    const targetDir = effectiveDirectory;
+    const reqId = ++commitsRequestSeqRef.current;
     setCommitsLoading(true);
     setCommitsError(null);
     const to = currentBranch && currentBranch !== 'HEAD' ? `refs/heads/${currentBranch}` : 'HEAD';
-    serviceGet<{ all: GitLogEntry[] }>('/log', { directory, maxCount: '50', to })
+    serviceGet<{ all: GitLogEntry[] }>('/log', {
+      directory: targetDir,
+      maxCount: '50',
+      to,
+    })
       .then((res) => {
-        setCommits(res.all);
+        if (commitsRequestSeqRef.current !== reqId) return;
+        setCommitsState({ directory: targetDir, commits: res.all });
         setCommitsLoading(false);
         setSelectedCommitHash((prev) => {
           if (prev && res.all.some((c) => c.hash === prev)) return prev;
@@ -832,25 +1598,28 @@ export const DiffView: React.FC<DiffViewProps> = ({
         });
       })
       .catch((err) => {
+        if (commitsRequestSeqRef.current !== reqId) return;
         setCommitsError(err instanceof Error ? err.message : String(err));
         setCommitsLoading(false);
       });
-  }, [currentBranch, directory, serviceGet]);
+  }, [currentBranch, effectiveDirectory, serviceGet]);
 
   useEffect(() => {
-    if (activeScope === 'commit' && directory) {
+    if (activeScope === 'commit' && effectiveDirectory) {
       loadCommits();
     }
-  }, [activeScope, directory, lifecycleTick, loadCommits, refreshTick]);
+  }, [activeScope, effectiveDirectory, lifecycleTick, loadCommits, refreshTick]);
 
   const commitScopeKey =
-    directory && selectedCommitHash ? `${directory}::${selectedCommitHash}` : null;
+    effectiveDirectory && selectedCommitHash
+      ? `${effectiveDirectory}::${selectedCommitHash}`
+      : null;
   const commitFiles =
     commitScopeKey && commitFilesState?.key === commitScopeKey ? commitFilesState.files : null;
 
   // Fetch files for selected commit
   useEffect(() => {
-    if (activeScope !== 'commit' || !directory || !selectedCommitHash || !commitScopeKey) {
+    if (activeScope !== 'commit' || !effectiveDirectory || !selectedCommitHash || !commitScopeKey) {
       setCommitFilesError(null);
       return;
     }
@@ -859,7 +1628,7 @@ export const DiffView: React.FC<DiffViewProps> = ({
     setCommitFilesError(null);
 
     serviceGet<{ files: GitCommitFile[] }>('/commit-files', {
-      directory,
+      directory: effectiveDirectory,
       hash: selectedCommitHash,
     })
       .then((res) => {
@@ -876,7 +1645,52 @@ export const DiffView: React.FC<DiffViewProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [activeScope, commitScopeKey, directory, selectedCommitHash, serviceGet]);
+  }, [activeScope, commitScopeKey, effectiveDirectory, selectedCommitHash, serviceGet]);
+
+  const prScopeKey =
+    effectiveDirectory && selectedPrNumber ? `${effectiveDirectory}::pr:${selectedPrNumber}` : null;
+  const activePrFilesState =
+    prScopeKey && prFilesState?.key === prScopeKey ? prFilesState : null;
+  const prFiles = activePrFilesState?.files ?? null;
+
+  // Fetch files for selected PR
+  useEffect(() => {
+    if (activeScope !== 'pr' || !effectiveDirectory || !selectedPrNumber || !prScopeKey) {
+      setPrFilesError(null);
+      return;
+    }
+    let cancelled = false;
+    setPrFilesLoading(true);
+    setPrFilesError(null);
+
+    serviceGet<{
+      files: GitPullRequestFile[];
+      baseRefOid: string;
+      headRefOid: string;
+    }>('/pr-files', {
+      directory: effectiveDirectory,
+      number: String(selectedPrNumber),
+    })
+      .then((res) => {
+        if (cancelled) return;
+        setPrFilesState({
+          key: prScopeKey,
+          files: res.files,
+          baseRefOid: res.baseRefOid,
+          headRefOid: res.headRefOid,
+        });
+        setPrFilesLoading(false);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setPrFilesError(err instanceof Error ? err.message : String(err));
+        setPrFilesLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeScope, effectiveDirectory, prScopeKey, refreshTick, selectedPrNumber, serviceGet]);
 
   const workingFileCount = useMemo(
     () => (status?.files ? status.files.filter(isWorkingStatusFile).length : 0),
@@ -889,6 +1703,17 @@ export const DiffView: React.FC<DiffViewProps> = ({
   );
 
   const changedFiles = useMemo<FileEntry[]>(() => {
+    if (activeScope === 'pr') {
+      return (prFiles ?? []).map((f) => ({
+        path: f.path,
+        previousPath: f.previousPath,
+        index: '',
+        working_dir: f.status,
+        insertions: f.insertions,
+        deletions: f.deletions,
+        isNew: f.status === 'A',
+      }));
+    }
     if (activeScope === 'commit') {
       return (commitFiles ?? []).map((f) => ({
         path: f.path,
@@ -936,14 +1761,16 @@ export const DiffView: React.FC<DiffViewProps> = ({
         };
       })
       .sort((a, b) => a.path.localeCompare(b.path));
-  }, [activeScope, branchFiles, commitFiles, status]);
+  }, [activeScope, branchFiles, commitFiles, prFiles, status]);
 
   const filesSettled =
-    activeScope === 'commit'
-      ? commitFiles !== null
-      : activeScope === 'branch'
-        ? branchFiles !== null
-        : status !== null;
+    activeScope === 'pr'
+      ? prFiles !== null
+      : activeScope === 'commit'
+        ? commitFiles !== null
+        : activeScope === 'branch'
+          ? branchFiles !== null
+          : status !== null;
 
   const changedPathsKey = useMemo(
     () => changedFiles.map((f) => f.path).join('\0'),
@@ -954,9 +1781,11 @@ export const DiffView: React.FC<DiffViewProps> = ({
     if (!filesSettled) return;
     const paths = changedPathsKey ? changedPathsKey.split('\0') : [];
     const pathSet = new Set(paths);
-    const scopeKey = `${directory ?? ''}:${activeScope}:${
-      activeScope === 'branch' ? qualifiedBranchBase ?? '' : ''
-    }:${activeScope === 'commit' ? selectedCommitHash ?? '' : ''}`;
+    const scopeKey = `${effectiveDirectory ?? ''}:${activeScope}:${
+      activeScope === 'branch' ? `${qualifiedBranchBase ?? ''}:${branchHeadRef}:${branchIncludeWorkingTree}` : ''
+    }:${activeScope === 'commit' ? selectedCommitHash ?? '' : ''}:${
+      activeScope === 'pr' ? selectedPrNumber ?? '' : ''
+    }`;
     const shouldInit = stackedScopeRef.current !== scopeKey;
     stackedScopeRef.current = scopeKey;
 
@@ -980,7 +1809,17 @@ export const DiffView: React.FC<DiffViewProps> = ({
       }
       return next;
     });
-  }, [activeScope, changedPathsKey, directory, filesSettled, qualifiedBranchBase, selectedCommitHash]);
+  }, [
+    activeScope,
+    branchHeadRef,
+    branchIncludeWorkingTree,
+    changedPathsKey,
+    effectiveDirectory,
+    filesSettled,
+    qualifiedBranchBase,
+    selectedCommitHash,
+    selectedPrNumber,
+  ]);
 
   const syncVisibleStackedFiles = useCallback(() => {
     const scrollRoot = diffScrollRef.current;
@@ -1066,27 +1905,34 @@ export const DiffView: React.FC<DiffViewProps> = ({
 
   const fetchFileDiff = useCallback(
     async (file: FileEntry): Promise<ServiceFileDiffResponse> => {
-      if (!directory) throw new Error('No project directory');
+      if (!effectiveDirectory) throw new Error('No project directory');
       const query: Record<string, string> = {
-        directory,
+        directory: effectiveDirectory,
         scope: activeScope,
         path: file.path,
         ignoreComments: ignoreComments ? 'true' : 'false',
       };
       if (file.previousPath) query.previousPath = file.previousPath;
-      if (activeScope === 'branch' && qualifiedBranchBase && currentBranch) {
+      if (activeScope === 'branch' && qualifiedBranchBase && branchHeadRef) {
         query.base = qualifiedBranchBase;
-        query.head = currentBranch;
+        query.head = branchHeadRef;
+        query.includeWorkingTree = branchIncludeWorkingTree ? 'true' : 'false';
       }
       if (activeScope === 'commit' && selectedCommitHash) {
         query.hash = selectedCommitHash;
       }
+      if (activeScope === 'pr' && activePrFilesState) {
+        query.base = activePrFilesState.baseRefOid;
+        query.head = activePrFilesState.headRefOid;
+      }
       return serviceGet<ServiceFileDiffResponse>('/file-diff', query);
     },
     [
+      activePrFilesState,
       activeScope,
-      currentBranch,
-      directory,
+      branchHeadRef,
+      branchIncludeWorkingTree,
+      effectiveDirectory,
       ignoreComments,
       qualifiedBranchBase,
       selectedCommitHash,
@@ -1211,9 +2057,11 @@ export const DiffView: React.FC<DiffViewProps> = ({
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [changedFiles, displayFile, handleSelectFile, isTreeMode, treeFileOrder, treeSelectedFile]);
 
-  const requestKeyPrefix = `${directory ?? ''}::${activeScope}::${qualifiedBranchBase ?? ''}::${
-    selectedCommitHash ?? ''
-  }::${ignoreComments ? 'no-comments' : 'comments'}::${refreshTick}::${lifecycleTick}`;
+  const requestKeyPrefix = `${effectiveDirectory ?? ''}::${activeScope}::${qualifiedBranchBase ?? ''}::${branchHeadRef}::${
+    branchIncludeWorkingTree ? 'wt' : 'committed'
+  }::${selectedCommitHash ?? ''}::${selectedPrNumber ?? ''}::${
+    ignoreComments ? 'no-comments' : 'comments'
+  }::${refreshTick}::${lifecycleTick}`;
 
   useEffect(() => {
     loadedDiffsRef.current.clear();
@@ -1257,8 +2105,10 @@ export const DiffView: React.FC<DiffViewProps> = ({
     }
   }, [findIndex, findMatches]);
 
+  const selectedPr = prs.find((p) => p.number === selectedPrNumber) ?? null;
+
   const renderBody = () => {
-    if (!directory) {
+    if (!effectiveDirectory) {
       return (
         <div className="oc-diff-empty">Select a project or session directory to view diffs.</div>
       );
@@ -1339,6 +2189,37 @@ export const DiffView: React.FC<DiffViewProps> = ({
         );
       }
     }
+    if (activeScope === 'pr') {
+      if ((prsLoading || prFilesLoading) && !prFiles) {
+        return (
+          <div className="oc-diff-empty">
+            <Icon name="loader-4" className="oc-icon oc-spin" />
+            <span>Loading pull request diff…</span>
+          </div>
+        );
+      }
+      if (prFilesError || (prsError && prs.length === 0)) {
+        return (
+          <div className="oc-diff-empty oc-diff-empty--col">
+            <div className="oc-diff-empty-title">Failed to load pull request diff</div>
+            <div className="oc-diff-empty-desc">{prFilesError ?? prsError}</div>
+            <button
+              type="button"
+              className="oc-link-btn"
+              onClick={() => {
+                loadPullRequests();
+                setRefreshTick((t) => t + 1);
+              }}
+            >
+              Retry
+            </button>
+          </div>
+        );
+      }
+      if (!selectedPrNumber && !prsLoading) {
+        return <div className="oc-diff-empty">No pull requests found for this repository.</div>;
+      }
+    }
     if (!filesSettled) {
       return (
         <div className="oc-diff-empty">
@@ -1350,13 +2231,15 @@ export const DiffView: React.FC<DiffViewProps> = ({
     if (changedFiles.length === 0) {
       return (
         <div className="oc-diff-empty">
-          {activeScope === 'commit'
-            ? 'No changed files in this commit.'
-            : activeScope === 'branch' && qualifiedBranchBase
-              ? `No changes compared to ${branchRefLabel(qualifiedBranchBase)}.`
-              : activeScope === 'staged'
-                ? 'No staged changes.'
-                : 'Working tree is clean.'}
+          {activeScope === 'pr'
+            ? 'No changed files in this pull request.'
+            : activeScope === 'commit'
+              ? 'No changed files in this commit.'
+              : activeScope === 'branch' && qualifiedBranchBase
+                ? `No changes compared to ${branchRefLabel(qualifiedBranchBase)}.`
+                : activeScope === 'staged'
+                  ? 'No staged changes.'
+                  : 'Working tree is clean.'}
         </div>
       );
     }
@@ -1368,14 +2251,17 @@ export const DiffView: React.FC<DiffViewProps> = ({
         <MultiFileDiffEntry
           key={`${file.path}:${activeScope}`}
           visible={isExpanded}
+          directory={effectiveDirectory}
           file={file}
           scope={activeScope}
           layout={getLayoutForFile(file)}
           wrapLines={wrapLines}
+          ignoreComments={ignoreComments}
           themeId={themeId}
           isDark={isDark}
           isExpanded={isExpanded}
           isMounted={isMounted}
+          revision={refreshTick + lifecycleTick}
           onExpandedChange={handleExpandedChange}
           onLayoutChange={(path, nextLayout) =>
             setPerFileLayout((prev) => ({ ...prev, [path]: nextLayout }))
@@ -1383,6 +2269,8 @@ export const DiffView: React.FC<DiffViewProps> = ({
           registerSectionRef={registerSectionRef}
           registerViewerRef={registerViewerRef}
           fetchFileDiff={fetchFileDiff}
+          serviceGet={serviceGet}
+          onSelectRepository={handleSelectRepository}
           requestKeyPrefix={requestKeyPrefix}
           onDiffLoaded={handleDiffLoaded}
         />
@@ -1494,12 +2382,21 @@ export const DiffView: React.FC<DiffViewProps> = ({
   return (
     <div className="oc-diff-view">
       <div className="oc-diff-toolbar">
+        {repositoryOptions && repositoryOptions.length > 0 ? (
+          <NestedRepoPicker
+            repositories={repositoryOptions}
+            selectedRepository={effectiveDirectory}
+            onSelectRepository={handleSelectRepository}
+            repositoryRoot={rootDirectory}
+          />
+        ) : null}
         <ChangeScopeSelector
           scope={activeScope}
           workingCount={workingFileCount}
           stagedCount={stagedFileCount}
           branchCount={branchFiles?.length ?? null}
           commitCount={activeScope === 'commit' ? commitFiles?.length ?? null : null}
+          prCount={activeScope === 'pr' ? prFiles?.length ?? null : null}
           showBranchOption={showBranchOption}
           onScopeChange={(nextScope) => {
             setUserPickedScope(true);
@@ -1507,26 +2404,39 @@ export const DiffView: React.FC<DiffViewProps> = ({
           }}
         />
         {activeScope === 'branch' ? (
-          <BranchComparisonSelector
-            branches={status?.branches.all ?? []}
-            currentBranch={currentBranch}
-            base={qualifiedBranchBase}
-            automatic={branchBaseResolution?.source !== 'chosen'}
-            onSelect={(baseRef) => {
-              if (baseOverrideKey) {
-                setBaseOverrides((prev) => ({ ...prev, [baseOverrideKey]: baseRef }));
-              }
-            }}
-            onSelectAutomatic={() => {
-              if (baseOverrideKey) {
-                setBaseOverrides((prev) => {
-                  const next = { ...prev };
-                  delete next[baseOverrideKey];
-                  return next;
-                });
-              }
-            }}
-          />
+          <>
+            <BranchComparisonSelector
+              branches={status?.branches.all ?? []}
+              currentBranch={currentBranch}
+              base={qualifiedBranchBase}
+              automatic={branchBaseResolution?.source !== 'chosen'}
+              onSelect={(baseRef) => {
+                if (baseOverrideKey) {
+                  setBaseOverrides((prev) => ({ ...prev, [baseOverrideKey]: baseRef }));
+                }
+              }}
+              onSelectAutomatic={() => {
+                if (baseOverrideKey) {
+                  setBaseOverrides((prev) => {
+                    const next = { ...prev };
+                    delete next[baseOverrideKey];
+                    return next;
+                  });
+                }
+              }}
+            />
+            <BranchTargetSelector
+              branches={status?.branches.all ?? []}
+              currentBranch={currentBranch}
+              base={qualifiedBranchBase}
+              target={currentBranchTarget}
+              onSelect={(nextTarget) => {
+                if (baseOverrideKey) {
+                  setBranchTargets((prev) => ({ ...prev, [baseOverrideKey]: nextTarget }));
+                }
+              }}
+            />
+          </>
         ) : null}
         {activeScope === 'commit' ? (
           <>
@@ -1549,6 +2459,27 @@ export const DiffView: React.FC<DiffViewProps> = ({
                       message: err instanceof Error ? err.message : 'Could not open commit',
                     });
                   });
+                }}
+              />
+            ) : null}
+          </>
+        ) : null}
+        {activeScope === 'pr' ? (
+          <>
+            <PullRequestComparisonSelector
+              prs={prs}
+              selectedNumber={selectedPrNumber}
+              loading={prsLoading}
+              error={prsError}
+              onSelect={(pr) => setSelectedPrNumber(pr.number)}
+              onRefresh={loadPullRequests}
+            />
+            {selectedPr?.url ? (
+              <ToolbarIconButton
+                label="Open pull request in browser"
+                icon="external-link"
+                onClick={() => {
+                  void host.openUrl(selectedPr.url);
                 }}
               />
             ) : null}

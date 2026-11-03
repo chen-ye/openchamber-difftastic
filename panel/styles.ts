@@ -204,6 +204,124 @@ export const PANEL_CSS = `
     white-space: nowrap;
   }
 
+  .oc-picker-trigger--repo {
+    max-width: 180px;
+  }
+
+  .oc-picker-trigger-prefix {
+    color: var(--surface-muted-foreground, var(--oc-muted));
+    font-size: 12px;
+    flex-shrink: 0;
+  }
+
+  /* Submodule & Nested Repository cards */
+  .oc-submodule-box {
+    padding: 12px 14px;
+    border-bottom: 1px solid color-mix(in srgb, var(--interactive-border, var(--oc-border)) 30%, transparent);
+    background: color-mix(in srgb, var(--surface-elevated, var(--oc-elevated)) 45%, transparent);
+  }
+
+  .oc-submodule-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .oc-submodule-title {
+    font-weight: 600;
+    font-size: 12.5px;
+    color: var(--surface-foreground, var(--oc-fg));
+  }
+
+  .oc-submodule-meta {
+    font-size: 12px;
+    color: var(--surface-muted-foreground, var(--oc-muted));
+    margin-top: 2px;
+  }
+
+  .oc-submodule-open-btn {
+    height: 28px;
+    padding: 0 10px;
+    border-radius: calc(var(--radius, 9px) - 2px);
+    border: 1px solid color-mix(in srgb, var(--surface-foreground, var(--oc-fg)) 16%, transparent);
+    background: var(--surface-elevated, var(--oc-elevated));
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--surface-foreground, var(--oc-fg));
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .oc-submodule-open-btn:hover {
+    background: var(--interactive-hover, var(--oc-hover));
+  }
+
+  .oc-nested-repo-box {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 10px 0;
+  }
+
+  .oc-nested-repo-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 0 12px 6px;
+  }
+
+  .oc-nested-repo-header-text {
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+
+  .oc-nested-repo-title {
+    font-weight: 600;
+    font-size: 12.5px;
+    color: var(--surface-foreground, var(--oc-fg));
+  }
+
+  .oc-nested-repo-desc {
+    font-size: 12px;
+    color: var(--surface-muted-foreground, var(--oc-muted));
+  }
+
+  .oc-nested-repo-empty {
+    padding: 4px 12px;
+    font-size: 12px;
+    color: var(--surface-muted-foreground, var(--oc-muted));
+  }
+
+  .oc-nested-repo-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .oc-nested-repo-item {
+    border-top: 1px solid color-mix(in srgb, var(--interactive-border, var(--oc-border)) 25%, transparent);
+  }
+
+  .oc-nested-repo-file-btn {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 6px 12px;
+    text-align: left;
+    font-size: 12.5px;
+    color: var(--surface-muted-foreground, var(--oc-muted));
+  }
+
+  .oc-nested-repo-file-btn:hover {
+    background: color-mix(in srgb, var(--interactive-hover, var(--oc-hover)) 50%, transparent);
+    color: var(--surface-foreground, var(--oc-fg));
+  }
+
   .oc-dropdown-menu {
     position: absolute;
     top: calc(100% + 4px);
