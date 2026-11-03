@@ -1,0 +1,28 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "allowImportingTsExtensions": true,
+    "baseUrl": ".",
+    "paths": {
+      "@openchamber/sdk": ["../openchamber/packages/sdk/src/index.ts"],
+      "@openchamber/sdk/ui": ["../openchamber/packages/sdk/src/ui/index.ts"],
+      "@openchamber/sdk/schemas": ["../openchamber/packages/sdk/src/schemas.ts"],
+      "zod": ["./node_modules/zod"]
+    }
+  },
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.tsx",
+    "panel/**/*.ts",
+    "panel/**/*.tsx",
+    "service/**/*.ts",
+    "scripts/**/*.ts"
+  ]
+}

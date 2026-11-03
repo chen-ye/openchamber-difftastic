@@ -1,0 +1,54 @@
+{
+  "name": "openchamber-difftastic",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Difftastic structural diff panel extension for OpenChamber",
+  "scripts": {
+    "build": "bun scripts/build.ts",
+    "type-check": "./node_modules/.bin/tsc --noEmit",
+    "test": "bun test"
+  },
+  "openchamber": {
+    "apiVersion": 1,
+    "engines": {
+      "openchamber": ">=1.24.0"
+    },
+    "contributes": {
+      "panel": {
+        "id": "difftastic-changes",
+        "name": "Difftastic",
+        "icon": "icon.svg",
+        "entry": "panel/index.html"
+      },
+      "page": {
+        "entry": "panel/index.html",
+        "title": "Difftastic Changes"
+      },
+      "service": {
+        "entry": "service/main.js",
+        "runtime": "host",
+        "permissions": {
+          "exec": [
+            "git",
+            "difft"
+          ]
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "@pierre/diffs": "1.6.1",
+    "@pierre/highlights": "0.2.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.15",
+    "@types/node": "^24.3.1",
+    "@types/react": "^19.1.10",
+    "@types/react-dom": "^19.1.7",
+    "typescript": "^5.8.3"
+  }
+}
