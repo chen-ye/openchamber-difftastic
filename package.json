@@ -4,6 +4,10 @@
   "private": true,
   "type": "module",
   "description": "Difftastic structural diff panel extension for OpenChamber",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/chen-ye/openchamber-difftastic.git"
+  },
   "scripts": {
     "build": "bun scripts/build.ts",
     "type-check": "./node_modules/.bin/tsc --noEmit",
